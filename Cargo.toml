@@ -1,0 +1,23 @@
+[package]
+name = "idm-system-tool"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+winreg = "0.52"
+dirs = "5"
+eframe = "0.27"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
