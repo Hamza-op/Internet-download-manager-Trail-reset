@@ -1,6 +1,6 @@
-/target
-
-# Except for the final executable
+/target/*
+!/target/release
+/target/release/*
 !/target/release/idm-system-tool.exe
 
 # Ignore Cargo.lock if this is a library, but since it's an application we keep it.
