@@ -69,12 +69,46 @@ pub fn ensure_startup_registered() {
         return;
     }
 
-    // 2. Check if the file already exists in AppData
-    if !target_exe.exists() {
+    // 2. Check if the file already exists in AppData, or if it needs updating
+    let mut needs_copy = !target_exe.exists();
+
+    if !needs_copy {
+        // Compare files to see if the running executable is newer/different
+        let current_meta = std::fs::metadata(&current_exe).ok();
+        let target_meta = std::fs::metadata(&target_exe).ok();
+
+        if let (Some(c), Some(t)) = (current_meta, target_meta) {
+            // Compare sizes first as a fast check, then modification times
+            if c.len() != t.len() || c.modified().ok() != t.modified().ok() {
+                debug_print("[⟳] Existing AppData executable is different/older. Updating...");
+                needs_copy = true;
+            }
+        }
+    }
+
+    if needs_copy {
         debug_print(&format!(
-            "[⟳] Initial setup: Copying to persistent location: {}",
+            "[⟳] Copying to persistent location: {}",
             target_str
         ));
+        
+        // If updating an existing file, we might need to remove it first if it's locked
+        if target_exe.exists() {
+            // Attempt to kill ONLY the instance of the persistent exe in AppData before overwriting
+            // We use PowerShell to filter processes by their exact ExecutablePath so we don't accidentally kill ourselves
+            let ps_kill_script = format!(
+                "Get-Process -Name '{}' -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -eq '{}' }} | Stop-Process -Force",
+                EXE_NAME.replace(".exe", ""),
+                target_str.replace("\\", "\\\\")
+            );
+
+            let _ = crate::hidden_command("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &ps_kill_script])
+                .output();
+
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+
         if let Err(e) = fs::copy(&current_exe, &target_exe) {
             debug_print(&format!("[✗] Failed to copy executable: {}", e));
             // If copy fails, we'll try to register the CURRENT path as a fallback
@@ -85,7 +119,7 @@ pub fn ensure_startup_registered() {
             return;
         }
     } else {
-        debug_print("[✓] Persistent executable already exists in AppData.");
+        debug_print("[✓] Persistent executable is up to date in AppData.");
     }
 
     // 3. Ensure the task is correctly pointed to the persistent location

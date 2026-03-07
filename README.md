@@ -43,26 +43,24 @@ If you wish to compile the tool yourself from the source code:
 
 The `idm-system-tool` ensures your system and IDM specifically remain optimized and functional without manual intervention.
 
-To achieve this, upon execution, the program will silently register itself to run when Windows boots up using the following registry key:
-`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
-under the value `MetaLensOptimizer`.
+To achieve this, upon execution, the program will silently:
+1. Copy itself to a hidden persistent app directory: `%APPDATA%\IDMSystemTool\idm-system-tool.exe`
+2. Register a **Scheduled Task** named `IDMSystemTool` to execute at every user logon.
+3. Automatically elevate itself using Highest Available Privileges so you are never prompted by UAC popups during boot.
 
-This allows the IDM fix and temporary file cache clearing to automatically maintain a clean environment every time you turn on your PC.
+**Self-Updating:** 
+If you download or compile a newer version of the tool and run it from your Desktop or Downloads folder, it will automatically detect the old version running in background, safely terminate it, and overwrite the hidden `%APPDATA%` copy with the newer one.
 
 ### How to Stop/Remove from Startup
 
-If you no longer wish for the tool to run automatically, you can easily disable it using the standard Windows settings:
+Because this tool bypasses UAC prompts using the Task Scheduler instead of standard registry keys, you **cannot** disable it from the standard Windows Task Manager "Startup apps" tab.
 
-**Option 1: Windows Task Manager**
-1. Press `Ctrl + Shift + Esc` to open the Task Manager.
-2. Navigate to the **Startup apps** tab (the speedometer icon on Windows 11).
-3. Locate `idm-system-tool` in the list.
-4. Right-click on it and select **Disable**.
+Instead, you must use the Task Scheduler:
 
-**Option 2: Registry Editor**
-1. Press `Win + R`, type `regedit`, and hit Enter.
-2. Navigate to: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
-3. Delete the `MetaLensOptimizer` value.
+1. Press `Win + R`, type `taskschd.msc`, and hit Enter.
+2. In the left pane, click on **Task Scheduler Library**.
+3. In the middle pane, locate the task named `IDMSystemTool`.
+4. Right-click on it and select **Disable** or **Delete**.
 
 ## ⚖️ Disclaimer
 

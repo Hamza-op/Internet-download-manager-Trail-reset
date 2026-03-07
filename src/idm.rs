@@ -185,7 +185,7 @@ fn delete_settings_backup() {
 fn delete_queue() {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
-    if let Ok(key) = hkcu.open_subkey_with_flags(r"Software\DownloadManager", KEY_ALL_ACCESS) {
+    if let Ok(key) = hkcu.open_subkey_with_flags(r"Software\DownloadManager", KEY_READ | KEY_WRITE) {
         [
             "FName",
             "LName",
@@ -288,29 +288,23 @@ fn delete_clsid_keys(take_permission: bool) {
             keys_to_delete.len()
         ));
 
-        let clsid_write = match hkcu.open_subkey_with_flags(clsid_path, KEY_ALL_ACCESS) {
-            Ok(k) => k,
-            Err(e) => {
-                debug_print(&format!(
-                    "    [✗] Cannot open CLSID with write access: {}",
-                    e
-                ));
-                return;
-            }
-        };
+        let clsid_write = hkcu.open_subkey_with_flags(clsid_path, KEY_WRITE).ok();
 
         keys_to_delete
             .iter()
-            .for_each(|key_name| match clsid_write.delete_subkey_all(key_name) {
-                Ok(_) => {
-                    debug_print(&format!("    Deleted — {}", key_name));
+            .for_each(|key_name| {
+                let mut deleted = false;
+                if let Some(ref cw) = clsid_write {
+                    deleted = cw.delete_subkey_all(key_name).is_ok();
                 }
-                Err(_) if take_permission => {
+
+                if deleted {
+                    debug_print(&format!("    Deleted — {}", key_name));
+                } else if take_permission {
                     let full_path = format!("HKCU\\{}\\{}", clsid_path, key_name);
                     debug_print(&format!("    [⟳] Taking ownership of {}...", key_name));
                     take_ownership_and_delete(&full_path);
-                }
-                Err(_) => {
+                } else {
                     debug_print(&format!("    [✗] Failed — {}", key_name));
                 }
             });
@@ -327,7 +321,7 @@ fn is_guid_format(name: &str) -> bool {
 fn is_idm_clsid_key(parent: &RegKey, name: &str) -> bool {
     let subkey = match parent.open_subkey(name) {
         Ok(k) => k,
-        Err(_) => return false,
+        Err(e) => return e.raw_os_error() == Some(5), // ERROR_ACCESS_DENIED commonly implies IDM blocked access
     };
 
     // bat line 564: skip if has LocalServer32 / InProcServer32 / InProcHandler32
