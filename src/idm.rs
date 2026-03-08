@@ -96,11 +96,11 @@ pub fn fix_popup() {
         Err(_) => debug_print("  [✗] IDM registry path not found."),
     }
 
-    // 2. Disable IDMGrHlp.exe (The actual popup trigger)
-    disable_idm_helper();
+    // 2. Neutralize IDMIntegrator64.exe
+    neutralize_integrator();
 }
 
-fn disable_idm_helper() {
+pub fn neutralize_integrator() {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let idm_path = match hkcu.open_subkey(r"Software\DownloadManager") {
         Ok(key) => key
@@ -119,25 +119,57 @@ fn disable_idm_helper() {
         return;
     }
 
-    let helper_path = idm_path.join("IDMGrHlp.exe");
-    if helper_path.exists() {
-        debug_print("  [⟳] Disabling IDMGrHlp.exe...");
-
-        kill_idm();
-
-        let backup_path = idm_path.join("IDMGrHlp.exe.bak");
-
-        if !backup_path.exists() {
-            if let Err(e) = std::fs::rename(&helper_path, &backup_path) {
-                debug_print(&format!("  [✗] Failed to rename helper: {}", e));
+    let integrator_path = idm_path.join("IDMIntegrator64.exe");
+    if integrator_path.exists() {
+        // Check size
+        if let Ok(metadata) = std::fs::metadata(&integrator_path) {
+            if metadata.len() == 0 {
+                debug_print("  [✓] IDMIntegrator64.exe is already neutralized.");
                 return;
             }
         }
 
-        if let Err(e) = std::fs::write(&helper_path, "") {
-            debug_print(&format!("  [✗] Failed to create dummy helper: {}", e));
-        } else {
-            debug_print("  [✓] IDMGrHlp.exe neutralized.");
+        debug_print(&format!("  [⟳] Neutralizing: {}", integrator_path.display()));
+
+        kill_idm();
+
+        let backup_path = idm_path.join("IDMIntegrator64.exe.bak");
+        let integrator_str = integrator_path.to_string_lossy();
+
+        // 1. Take ownership and grant full access via cmd to avoid access denied
+        let _ = crate::hidden_command("takeown")
+            .args(["/F", &integrator_str])
+            .output();
+        let _ = crate::hidden_command("icacls")
+            .args([&integrator_str, "/grant", "administrators:F", "/Q"])
+            .output();
+
+        // 2. Manage backup via Rust native for reliability
+        if backup_path.exists() {
+            let _ = std::fs::remove_file(&backup_path);
+        }
+
+        // 3. Rename current to backup
+        match std::fs::rename(&integrator_path, &backup_path) {
+            Ok(_) => debug_print("  [✓] IDMIntegrator64.exe renamed to .bak"),
+            Err(e) => {
+                debug_print(&format!("  [✗] Failed to rename: {}", e));
+                // Force copy and delete
+                if std::fs::copy(&integrator_path, &backup_path).is_ok() {
+                    let _ = std::fs::remove_file(&integrator_path);
+                }
+            }
+        }
+
+        // 4. Create empty file and lock it
+        match std::fs::write(&integrator_path, "") {
+            Ok(_) => {
+                let _ = crate::hidden_command("icacls")
+                    .args([&integrator_str, "/deny", "Everyone:(W)", "/Q"])
+                    .output();
+                debug_print("  [✓] IDMIntegrator64.exe neutralized/replaced.");
+            }
+            Err(e) => debug_print(&format!("  [✗] Failed to write 0-byte file: {}", e)),
         }
     }
 }
@@ -147,24 +179,33 @@ fn disable_idm_helper() {
 // ─────────────────────────────────────────────────────────────
 
 fn kill_idm() {
-    let output = crate::hidden_command("tasklist")
-        .args(["/fi", "imagename eq idman.exe"])
-        .output();
+    let processes = ["idman.exe", "IDMIntegrator64.exe"];
+    let mut killed_any = false;
 
-    let is_running = match &output {
-        Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout.to_lowercase().contains("idman.exe")
-        }
-        Err(_) => false,
-    };
-
-    if is_running {
-        debug_print("  [i] IDM is running, terminating...");
-        let _ = crate::hidden_command("taskkill")
-            .args(["/f", "/im", "idman.exe"])
+    for proc in processes {
+        let output = crate::hidden_command("tasklist")
+            .args(["/fi", &format!("imagename eq {}", proc)])
             .output();
-        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let is_running = match &output {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                stdout.to_lowercase().contains(&proc.to_lowercase())
+            }
+            Err(_) => false,
+        };
+
+        if is_running {
+            debug_print(&format!("  [i] {} is running, terminating...", proc));
+            let _ = crate::hidden_command("taskkill")
+                .args(["/f", "/im", proc])
+                .output();
+            killed_any = true;
+        }
+    }
+
+    if killed_any {
+        std::thread::sleep(std::time::Duration::from_millis(800));
     }
 }
 
