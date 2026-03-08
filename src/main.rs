@@ -10,6 +10,7 @@ mod cleanup;
 mod idm;
 mod optimize;
 mod startup;
+mod killer;
 
 /// Toggle this to `false` for production silent mode.
 const DEBUG: bool = true;
@@ -57,15 +58,16 @@ enum PhaseStatus {
 
 #[derive(Clone)]
 struct Phase {
-    icon: &'static str,
     name: &'static str,
     status: PhaseStatus,
+    detail: String,
 }
 
 struct TaskState {
     pub is_done: bool,
     pub phases: Vec<Phase>,
     pub active_phase: usize,
+    pub cleanup_stats: Option<cleanup::CleanupStats>,
 }
 
 impl TaskState {
@@ -73,12 +75,13 @@ impl TaskState {
         Self {
             is_done: false,
             active_phase: 0,
+            cleanup_stats: None,
             phases: vec![
-                Phase { icon: "»", name: "IDM Activation Reset", status: PhaseStatus::Pending },
-                Phase { icon: "»", name: "Temporary File Cleanup", status: PhaseStatus::Pending },
-                Phase { icon: "»", name: "Gaming Optimizations", status: PhaseStatus::Pending },
-                Phase { icon: "»", name: "Adobe Optimization", status: PhaseStatus::Pending },
-                Phase { icon: "»", name: "System & Privacy", status: PhaseStatus::Pending },
+                Phase { name: "IDM Activation Reset", status: PhaseStatus::Pending, detail: String::new() },
+                Phase { name: "Temporary File Cleanup", status: PhaseStatus::Pending, detail: String::new() },
+                Phase { name: "Gaming Optimizations", status: PhaseStatus::Pending, detail: String::new() },
+                Phase { name: "Adobe Optimization", status: PhaseStatus::Pending, detail: String::new() },
+                Phase { name: "System & Privacy", status: PhaseStatus::Pending, detail: String::new() },
             ],
         }
     }
@@ -87,12 +90,20 @@ impl TaskState {
         if idx < self.phases.len() {
             self.active_phase = idx;
             self.phases[idx].status = PhaseStatus::Running;
+            self.phases[idx].detail.clear();
+        }
+    }
+
+    fn set_detail(&mut self, idx: usize, detail: String) {
+        if idx < self.phases.len() {
+            self.phases[idx].detail = detail;
         }
     }
 
     fn complete_phase(&mut self, idx: usize) {
         if idx < self.phases.len() {
             self.phases[idx].status = PhaseStatus::Done;
+            self.phases[idx].detail.clear();
         }
     }
 
@@ -103,21 +114,27 @@ impl TaskState {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Color Palette
+// Color Palette — refined dark theme
 // ─────────────────────────────────────────────────────────────
 
-const BG_DARK: egui::Color32 = egui::Color32::from_rgb(8, 8, 18);
-const BG_CARD: egui::Color32 = egui::Color32::from_rgb(18, 18, 34);
-const BG_CARD_ACTIVE: egui::Color32 = egui::Color32::from_rgb(24, 22, 44);
-const ACCENT_CYAN: egui::Color32 = egui::Color32::from_rgb(56, 189, 248);
-const ACCENT_BLUE: egui::Color32 = egui::Color32::from_rgb(99, 102, 241);
-const ACCENT_PURPLE: egui::Color32 = egui::Color32::from_rgb(168, 85, 247);
-const ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(74, 222, 128);
-const ACCENT_AMBER: egui::Color32 = egui::Color32::from_rgb(251, 191, 36);
-const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(240, 240, 255);
-const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(90, 90, 130);
-const BORDER_DIM: egui::Color32 = egui::Color32::from_rgb(32, 32, 56);
-const RING_BG: egui::Color32 = egui::Color32::from_rgb(28, 28, 50);
+const BG_BASE:       egui::Color32 = egui::Color32::from_rgb(10, 10, 20);
+const BG_SURFACE:    egui::Color32 = egui::Color32::from_rgb(16, 17, 30);
+const BG_ELEVATED:   egui::Color32 = egui::Color32::from_rgb(22, 23, 40);
+
+const ACCENT_1:      egui::Color32 = egui::Color32::from_rgb(99, 102, 241);  // Indigo
+const ACCENT_2:      egui::Color32 = egui::Color32::from_rgb(139, 92, 246);  // Violet
+const ACCENT_3:      egui::Color32 = egui::Color32::from_rgb(59, 130, 246);  // Blue
+
+const SUCCESS:       egui::Color32 = egui::Color32::from_rgb(52, 211, 153);  // Emerald
+const RUNNING_GLOW:  egui::Color32 = egui::Color32::from_rgb(96, 165, 250);  // Light blue
+const WARN:          egui::Color32 = egui::Color32::from_rgb(251, 191, 36);  // Amber
+
+const TEXT_PRIMARY:  egui::Color32 = egui::Color32::from_rgb(237, 237, 250);
+const TEXT_SECONDARY:egui::Color32 = egui::Color32::from_rgb(148, 148, 180);
+const TEXT_MUTED:    egui::Color32 = egui::Color32::from_rgb(75, 75, 110);
+
+const BORDER_SUBTLE: egui::Color32 = egui::Color32::from_rgb(30, 30, 55);
+const RING_TRACK:    egui::Color32 = egui::Color32::from_rgb(25, 25, 48);
 
 // ─────────────────────────────────────────────────────────────
 // GUI App
@@ -133,7 +150,8 @@ impl eframe::App for MaintenanceApp {
         let state = self.state.lock().unwrap();
         let is_done = state.is_done;
         let progress = state.progress();
-        let phases = state.phases.clone();
+        let phases: Vec<Phase> = state.phases.iter().cloned().collect();
+        let cleanup_stats = state.cleanup_stats.clone();
         drop(state);
 
         if is_done {
@@ -144,202 +162,300 @@ impl eframe::App for MaintenanceApp {
         let elapsed = self.start_time.elapsed().as_secs();
         let t = ctx.input(|i| i.time) as f32;
 
-        let panel_frame = egui::Frame::none().fill(BG_DARK).inner_margin(egui::Margin::same(0.0));
+        let panel = egui::Frame::none().fill(BG_BASE).inner_margin(egui::Margin::same(0.0));
 
-        egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(panel).show(ctx, |ui| {
             let full_rect = ui.available_rect_before_wrap();
 
-            // Frame content
-            ui.allocate_ui_at_rect(full_rect.shrink2(egui::vec2(20.0, 16.0)), |ui| {
-                ui.style_mut().visuals.override_text_color = Some(TEXT_PRIMARY);
-                ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+            // ── Top accent gradient bar ──
+            let bar_height = 3.0;
+            let bar_rect = egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), bar_height));
+            let painter = ui.painter();
+            let steps = 40;
+            let step_w = bar_rect.width() / steps as f32;
+            for i in 0..steps {
+                let frac = i as f32 / steps as f32;
+                let shift = ((t * 0.5 + frac * 2.0).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                let c = lerp_color(ACCENT_1, ACCENT_2, shift);
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(bar_rect.min.x + i as f32 * step_w, bar_rect.min.y),
+                    egui::vec2(step_w + 1.0, bar_height),
+                );
+                painter.rect_filled(r, 0.0, c);
+            }
 
-                // ── Title ──
+            // ── Content area ──
+            let content_rect = full_rect.shrink2(egui::vec2(24.0, 0.0));
+            let content_rect = egui::Rect::from_min_max(
+                egui::pos2(content_rect.min.x, content_rect.min.y + bar_height + 12.0),
+                content_rect.max,
+            );
+
+            ui.allocate_ui_at_rect(content_rect, |ui| {
+                ui.style_mut().visuals.override_text_color = Some(TEXT_PRIMARY);
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
+
+                // ── Header ──
                 ui.vertical_centered(|ui| {
-                    ui.add_space(2.0);
-                    let wave = ((t * 1.0).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-                    let title_c = lerp_color(ACCENT_CYAN, ACCENT_PURPLE, wave);
                     ui.label(
                         egui::RichText::new("SYSTEM OPTIMIZER")
-                            .size(18.0)
+                            .size(16.0)
                             .strong()
-                            .color(title_c),
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.add_space(1.0);
+                    let subtitle = if progress >= 1.0 {
+                        "All tasks completed"
+                    } else {
+                        "Optimizing your system..."
+                    };
+                    ui.label(
+                        egui::RichText::new(subtitle)
+                            .size(10.5)
+                            .color(TEXT_SECONDARY),
                     );
                 });
 
-                ui.add_space(8.0);
+                ui.add_space(12.0);
 
-                // ── Circular Progress Ring ──
+                // ── Progress Ring ──
                 ui.vertical_centered(|ui| {
-                    let ring_size = 80.0;
+                    let ring_size = 90.0;
                     let (rect, _) = ui.allocate_exact_size(
                         egui::vec2(ring_size, ring_size),
                         egui::Sense::hover(),
                     );
                     let center = rect.center();
-                    let radius = ring_size / 2.0 - 6.0;
-                    let thickness = 5.0;
-
+                    let radius = ring_size / 2.0 - 8.0;
+                    let thickness = 4.5;
                     let painter = ui.painter();
 
-                    // Background ring
-                    draw_arc(painter, center, radius, thickness, 0.0, 1.0, RING_BG);
+                    // Track
+                    draw_arc(painter, center, radius, thickness, 0.0, 1.0, RING_TRACK);
 
-                    // Progress arc
+                    // Progress arc with gradient effect
                     if progress > 0.0 {
-                        let arc_color = if progress >= 1.0 {
-                            ACCENT_GREEN
+                        let arc_col = if progress >= 1.0 {
+                            SUCCESS
                         } else {
-                            let shimmer = ((t * 2.0).sin() * 0.4 + 0.6).clamp(0.2, 1.0);
-                            lerp_color(ACCENT_BLUE, ACCENT_CYAN, shimmer)
+                            let pulse = ((t * 1.5).sin() * 0.3 + 0.7).clamp(0.4, 1.0);
+                            lerp_color(ACCENT_3, ACCENT_1, pulse)
                         };
-                        draw_arc(painter, center, radius, thickness + 1.0, 0.0, progress, arc_color);
+                        draw_arc(painter, center, radius, thickness + 1.5, 0.0, progress, arc_col);
 
-                        // Glow dot at arc tip
+                        // Glow tip
                         if progress < 1.0 {
-                            let angle =
-                                -std::f32::consts::FRAC_PI_2 + progress * std::f32::consts::TAU;
-                            let tip = egui::pos2(
-                                center.x + angle.cos() * radius,
-                                center.y + angle.sin() * radius,
-                            );
-                            let glow_a = ((t * 4.0).sin() * 0.3 + 0.7).clamp(0.4, 1.0);
+                            let angle = -std::f32::consts::FRAC_PI_2 + progress * std::f32::consts::TAU;
+                            let tip = egui::pos2(center.x + angle.cos() * radius, center.y + angle.sin() * radius);
+                            let glow = ((t * 3.0).sin() * 0.35 + 0.65).clamp(0.3, 1.0);
                             painter.circle_filled(
                                 tip,
-                                5.0,
+                                4.5,
                                 egui::Color32::from_rgba_premultiplied(
-                                    arc_color.r(),
-                                    arc_color.g(),
-                                    arc_color.b(),
-                                    (glow_a * 200.0) as u8,
+                                    arc_col.r(), arc_col.g(), arc_col.b(), (glow * 220.0) as u8,
                                 ),
                             );
                         }
                     }
 
-                    // Center percentage text
+                    // Center text
                     let pct = (progress * 100.0) as u32;
-                    let pct_color = if pct == 100 { ACCENT_GREEN } else { TEXT_PRIMARY };
+                    let pct_col = if pct == 100 { SUCCESS } else { TEXT_PRIMARY };
                     painter.text(
-                        center,
+                        egui::pos2(center.x, center.y - 4.0),
                         egui::Align2::CENTER_CENTER,
                         format!("{}%", pct),
-                        egui::FontId::proportional(20.0),
-                        pct_color,
+                        egui::FontId::proportional(22.0),
+                        pct_col,
+                    );
+                    painter.text(
+                        egui::pos2(center.x, center.y + 14.0),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{}s", elapsed),
+                        egui::FontId::proportional(9.5),
+                        TEXT_MUTED,
                     );
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(12.0);
 
-                // ── Info badges ──
-                let username = std::env::var("USERNAME").unwrap_or_else(|_| "User".to_string());
-                ui.vertical_centered(|ui| {
-                    ui.horizontal(|ui| {
-                        let center_offset =
-                            (ui.available_width() - 200.0_f32.min(ui.available_width())) / 2.0;
-                        ui.add_space(center_offset.max(0.0));
-                        mini_badge(ui, &format!("USR: {}", username), TEXT_DIM);
-                        mini_badge(ui, &format!("{}s", elapsed), ACCENT_AMBER);
-                        mini_badge(ui, "SYS: Admin", ACCENT_GREEN);
-                    });
-                });
+                // ── Horizontal progress bar ──
+                let bar_h = 4.0;
+                let (bar_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), bar_h),
+                    egui::Sense::hover(),
+                );
+                {
+                    let painter = ui.painter();
+                    painter.rect_filled(bar_rect, egui::Rounding::same(2.0), RING_TRACK);
+                    if progress > 0.0 {
+                        let fill_w = bar_rect.width() * progress;
+                        let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
+                        let fill_col = if progress >= 1.0 { SUCCESS } else { ACCENT_1 };
+                        painter.rect_filled(fill_rect, egui::Rounding::same(2.0), fill_col);
+                    }
+                }
 
-                ui.add_space(10.0);
+                ui.add_space(14.0);
 
-                // ── Phase Cards with left accent bar ──
-                phases.iter().enumerate().for_each(|(i, phase)| {
-                    let (accent_col, text_col, is_active) = match phase.status {
-                        PhaseStatus::Done => (ACCENT_GREEN, ACCENT_GREEN, false),
-                        PhaseStatus::Running => (ACCENT_CYAN, ACCENT_CYAN, true),
-                        PhaseStatus::Pending => (BORDER_DIM, TEXT_DIM, false),
+                // ── Phase List ──
+                for (i, phase) in phases.iter().enumerate() {
+                    let is_active = phase.status == PhaseStatus::Running;
+                    let is_done = phase.status == PhaseStatus::Done;
+
+                    let (accent, text_col, icon, bg) = if is_done {
+                        (SUCCESS, SUCCESS, "✓", BG_SURFACE)
+                    } else if is_active {
+                        (RUNNING_GLOW, RUNNING_GLOW, "›", BG_ELEVATED)
+                    } else {
+                        (BORDER_SUBTLE, TEXT_MUTED, "○", BG_SURFACE)
                     };
 
-                    let card_bg = if is_active { BG_CARD_ACTIVE } else { BG_CARD };
-
                     let card = egui::Frame::none()
-                        .fill(card_bg)
-                        .rounding(egui::Rounding::same(6.0))
+                        .fill(bg)
+                        .rounding(egui::Rounding::same(8.0))
                         .inner_margin(egui::Margin {
-                            left: 10.0,
-                            right: 10.0,
-                            top: 6.0,
-                            bottom: 6.0,
+                            left: 12.0,
+                            right: 12.0,
+                            top: if phase.detail.is_empty() { 8.0 } else { 7.0 },
+                            bottom: if phase.detail.is_empty() { 8.0 } else { 7.0 },
                         })
-                        .stroke(egui::Stroke::new(1.0, BORDER_DIM));
+                        .stroke(egui::Stroke::new(
+                            if is_active { 1.0 } else { 0.5 },
+                            if is_active { lerp_color(ACCENT_1, ACCENT_3, ((t * 2.0).sin() * 0.5 + 0.5).clamp(0.0, 1.0)) } else { BORDER_SUBTLE },
+                        ));
 
-                    let response = card.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(phase.icon).size(13.0));
-                            ui.add_space(6.0);
+                    let resp = card.show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                // Icon
+                                let icon_col = if is_done {
+                                    SUCCESS
+                                } else if is_active {
+                                    let pulse = ((t * 3.0).sin() * 0.3 + 0.7).clamp(0.4, 1.0);
+                                    lerp_color(ACCENT_3, RUNNING_GLOW, pulse)
+                                } else {
+                                    TEXT_MUTED
+                                };
+                                ui.label(
+                                    egui::RichText::new(icon)
+                                        .size(if is_done { 12.0 } else { 14.0 })
+                                        .strong()
+                                        .color(icon_col),
+                                );
 
-                            let mut name_rt =
-                                egui::RichText::new(phase.name).size(12.0).color(text_col);
-                            if is_active {
-                                name_rt = name_rt.strong();
-                            }
-                            ui.label(name_rt);
+                                ui.add_space(6.0);
 
-                            // Right side status
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| match phase.status {
-                                    PhaseStatus::Done => {
+                                // Name
+                                let mut name_rt = egui::RichText::new(phase.name)
+                                    .size(12.0)
+                                    .color(text_col);
+                                if is_active {
+                                    name_rt = name_rt.strong();
+                                }
+                                ui.label(name_rt);
+
+                                // Right side
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if is_done {
+                                        // Pill badge
+                                        let pill = egui::Frame::none()
+                                            .fill(egui::Color32::from_rgba_premultiplied(52, 211, 153, 25))
+                                            .rounding(egui::Rounding::same(10.0))
+                                            .inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 2.0, bottom: 2.0 });
+                                        pill.show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new("DONE")
+                                                    .size(8.5)
+                                                    .strong()
+                                                    .color(SUCCESS),
+                                            );
+                                        });
+                                    } else if is_active {
+                                        // Animated spinner dots
+                                        let frame_idx = ((t * 4.0) as u32) % 3;
+                                        let dots: String = (0..3).map(|d| {
+                                            if d == frame_idx { '●' } else { '○' }
+                                        }).collect::<Vec<_>>().iter().collect();
                                         ui.label(
-                                            egui::RichText::new("OK").size(11.0).strong().color(ACCENT_GREEN),
+                                            egui::RichText::new(dots)
+                                                .size(8.0)
+                                                .color(RUNNING_GLOW),
                                         );
-                                    }
-                                    PhaseStatus::Running => {
-                                        let dots = match ((t * 3.0) as u32) % 4 {
-                                            0 => "●○○",
-                                            1 => "○●○",
-                                            2 => "○○●",
-                                            _ => "○●○",
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(dots).size(9.0).color(ACCENT_CYAN),
-                                        );
-                                    }
-                                    PhaseStatus::Pending => {
+                                    } else {
                                         ui.label(
                                             egui::RichText::new(format!("{}/{}", i + 1, phases.len()))
                                                 .size(9.0)
-                                                .color(egui::Color32::from_rgb(50, 50, 75)),
+                                                .color(TEXT_MUTED),
                                         );
                                     }
-                                },
-                            );
+                                });
+                            });
+
+                            // Sub-progress detail
+                            if !phase.detail.is_empty() {
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(22.0); // align with name
+                                    ui.label(
+                                        egui::RichText::new(&phase.detail)
+                                            .size(9.5)
+                                            .color(TEXT_SECONDARY)
+                                            .italics(),
+                                    );
+                                });
+                            }
                         });
                     });
 
-                    // Paint left accent bar over the card
-                    let card_rect = response.response.rect;
-                    let accent_rect = egui::Rect::from_min_size(
-                        card_rect.min,
-                        egui::vec2(3.0, card_rect.height()),
-                    );
-                    let painter = ui.painter();
-                    painter.rect_filled(
-                        accent_rect,
+                    // Left accent bar
+                    let r = resp.response.rect;
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(r.min, egui::vec2(3.0, r.height())),
                         egui::Rounding { nw: 8.0, sw: 8.0, ne: 0.0, se: 0.0 },
-                        accent_col,
+                        accent,
                     );
 
-                    ui.add_space(3.0);
-                });
+                    ui.add_space(2.0);
+                }
+
+                // ── Cleanup Stats Dashboard ──
+                if let Some(ref stats) = cleanup_stats {
+                    ui.add_space(8.0);
+
+                    let dash = egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(12, 20, 16))
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::same(10.0))
+                        .stroke(egui::Stroke::new(0.5, egui::Color32::from_rgb(30, 60, 40)));
+
+                    dash.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Freed
+                            stat_chip(ui, "FREED", &cleanup::format_bytes(stats.bytes_freed), SUCCESS);
+                            ui.add_space(12.0);
+                            // Files
+                            stat_chip(ui, "FILES", &stats.deleted.to_string(), ACCENT_3);
+                            ui.add_space(12.0);
+                            // Skipped
+                            stat_chip(ui, "SKIPPED", &stats.failed.to_string(), WARN);
+                        });
+                    });
+                }
 
                 // ── Footer ──
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        egui::RichText::new("Built with Rust  ·  github.com/hamza-op")
+                        egui::RichText::new("⚡ Built with Rust  ·  github.com/hamza-op")
                             .size(9.0)
-                            .color(egui::Color32::from_rgb(55, 55, 80)),
+                            .color(TEXT_MUTED),
                     );
                 });
             });
         });
 
-        ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
 
@@ -347,9 +463,6 @@ impl eframe::App for MaintenanceApp {
 // Drawing Helpers
 // ─────────────────────────────────────────────────────────────
 
-// removed to improve performance and styling
-
-/// Draw a circular arc using line segments
 fn draw_arc(
     painter: &egui::Painter,
     center: egui::Pos2,
@@ -373,9 +486,21 @@ fn draw_arc(
     });
 }
 
-fn mini_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    ui.label(egui::RichText::new(text).size(10.0).color(color));
-    ui.add_space(6.0);
+fn stat_chip(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .size(8.0)
+                .strong()
+                .color(TEXT_MUTED),
+        );
+        ui.label(
+            egui::RichText::new(value)
+                .size(13.0)
+                .strong()
+                .color(color),
+        );
+    });
 }
 
 fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
@@ -388,10 +513,51 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Toast Notification (F14)
+// ─────────────────────────────────────────────────────────────
+
+fn send_toast_notification(title: &str, body: &str) {
+    let ps_script = format!(
+        r#"
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+
+$template = @"
+<toast>
+  <visual>
+    <binding template="ToastGeneric">
+      <text>{}</text>
+      <text>{}</text>
+    </binding>
+  </visual>
+</toast>
+"@
+
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($template)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("IDMSystemTool").Show($toast)
+"#,
+        title.replace('"', "'"),
+        body.replace('"', "'"),
+    );
+
+    let _ = hidden_command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
+        .spawn();
+}
+
+// ─────────────────────────────────────────────────────────────
 // Main Execution
 // ─────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), eframe::Error> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--daemon") {
+        crate::killer::run_background_loop();
+        return Ok(());
+    }
+
     if !admin::is_admin() {
         if admin::elevate_self() {
             std::process::exit(0);
@@ -406,24 +572,56 @@ fn main() -> Result<(), eframe::Error> {
     let state_clone = state.clone();
 
     thread::spawn(move || {
-        let run_phase = |idx: usize, work: fn()| {
+        let cleanup_detail = Arc::new(Mutex::new(String::new()));
+
+        let run_phase = |idx: usize, detail_src: Option<Arc<Mutex<String>>>, work: Box<dyn FnOnce() + Send>| {
             state_clone.lock().unwrap().start_phase(idx);
-            work();
-            thread::sleep(Duration::from_millis(400));
-            state_clone.lock().unwrap().complete_phase(idx);
+
+            if let Some(ref src) = detail_src {
+                let src2 = src.clone();
+                let sc2 = state_clone.clone();
+                let watcher = thread::spawn(move || {
+                    loop {
+                        thread::sleep(Duration::from_millis(150));
+                        let detail = src2.lock().map(|s| s.clone()).unwrap_or_default();
+                        let mut st = sc2.lock().unwrap();
+                        if st.phases[idx].status != PhaseStatus::Running {
+                            break;
+                        }
+                        st.set_detail(idx, detail);
+                    }
+                });
+                work();
+                state_clone.lock().unwrap().complete_phase(idx);
+                let _ = watcher.join();
+            } else {
+                work();
+                thread::sleep(Duration::from_millis(400));
+                state_clone.lock().unwrap().complete_phase(idx);
+            }
         };
 
-        // Always run: IDM fix, temp clean, Adobe clean
-        run_phase(0, || {
+        run_phase(0, None, Box::new(|| {
             idm::reset_activation();
             idm::fix_popup();
-        });
+        }));
 
-        run_phase(1, || {
-            cleanup::clean_temp_files();
-        });
+        let detail_clone = cleanup_detail.clone();
+        run_phase(1, Some(cleanup_detail), Box::new(move || {
+            let stats = cleanup::clean_temp_files(Some(detail_clone));
+            CLEANUP_STATS.lock().unwrap().replace(stats);
+        }));
 
-        // Skip gaming & system/privacy if already done
+        if let Some(stats) = CLEANUP_STATS.lock().unwrap().take() {
+            let toast_body = format!(
+                "Freed {} · {} files cleaned",
+                cleanup::format_bytes(stats.bytes_freed),
+                stats.deleted,
+            );
+            state_clone.lock().unwrap().cleanup_stats = Some(stats);
+            send_toast_notification("System Optimizer", &toast_body);
+        }
+
         let already_optimized = is_already_optimized();
 
         if already_optimized {
@@ -434,39 +632,36 @@ fn main() -> Result<(), eframe::Error> {
                 state_clone.lock().unwrap().complete_phase(i);
             });
         } else {
-            run_phase(2, || {
+            run_phase(2, None, Box::new(|| {
                 optimize::optimize_for_gaming();
-            });
+            }));
         }
 
-        // Always run: Adobe clean
-        run_phase(3, || {
+        run_phase(3, None, Box::new(|| {
             optimize::optimize_for_adobe();
-        });
+        }));
 
         if !already_optimized {
-            run_phase(4, || {
+            run_phase(4, None, Box::new(|| {
                 optimize::optimize_system_and_privacy();
-            });
-
+            }));
             mark_as_optimized();
         }
 
-        // Show completed state for a few seconds
         thread::sleep(Duration::from_secs(3));
         state_clone.lock().unwrap().is_done = true;
     });
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([340.0, 480.0])
+            .with_inner_size([360.0, 530.0])
             .with_resizable(false)
             .with_always_on_top()
             .with_title("System Optimizer"),
         ..Default::default()
     };
 
-    eframe::run_native(
+    let _ = eframe::run_native(
         "System Optimizer",
         options,
         Box::new(|_cc| {
@@ -475,5 +670,18 @@ fn main() -> Result<(), eframe::Error> {
                 state,
             })
         }),
-    )
+    );
+
+    if let Ok(exe) = std::env::current_exe() {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new(exe)
+            .arg("--daemon")
+            .creation_flags(0x08000000)
+            .spawn();
+    }
+
+    Ok(())
 }
+
+static CLEANUP_STATS: std::sync::LazyLock<Mutex<Option<cleanup::CleanupStats>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));

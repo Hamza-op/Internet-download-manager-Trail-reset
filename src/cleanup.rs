@@ -2,13 +2,25 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::debug_print;
 
-/// Clean temporary files from common Windows temp directories.
-pub fn clean_temp_files() {
-    let temp_dirs = get_temp_dirs();
+/// Stats returned from a cleanup run.
+#[derive(Clone, Default)]
+pub struct CleanupStats {
+    pub deleted: u64,
+    pub failed: u64,
+    pub bytes_freed: u64,
+}
 
+/// Clean temporary files from common Windows temp directories.
+/// Accepts an optional progress callback to report sub-progress text.
+pub fn clean_temp_files(progress: Option<Arc<Mutex<String>>>) -> CleanupStats {
+    let temp_dirs = get_temp_dirs();
+    let total_dirs = temp_dirs.iter().filter(|d| d.exists()).count();
+
+    let mut completed = 0usize;
     let (total_deleted, total_failed, total_bytes_freed) = temp_dirs
         .iter()
         .filter(|dir| {
@@ -20,6 +32,19 @@ pub fn clean_temp_files() {
             }
         })
         .fold((0u64, 0u64, 0u64), |(acc_del, acc_fail, acc_bytes), dir| {
+            completed += 1;
+
+            // Push sub-progress update
+            if let Some(ref p) = progress {
+                let label = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| dir.to_string_lossy().to_string());
+                if let Ok(mut s) = p.lock() {
+                    *s = format!("Cleaning {} ({}/{})", label, completed, total_dirs);
+                }
+            }
+
             debug_print(&format!("  [⟳] Cleaning: {}", dir.display()));
 
             let (deleted, failed, bytes) = clean_directory(dir);
@@ -40,6 +65,12 @@ pub fn clean_temp_files() {
         total_failed,
         format_bytes(total_bytes_freed)
     ));
+
+    CleanupStats {
+        deleted: total_deleted,
+        failed: total_failed,
+        bytes_freed: total_bytes_freed,
+    }
 }
 
 /// Get list of temporary directories to clean.
@@ -206,7 +237,7 @@ fn clean_directory(dir: &PathBuf) -> (u64, u64, u64) {
     )
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;

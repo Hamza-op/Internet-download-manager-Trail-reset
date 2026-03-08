@@ -95,6 +95,83 @@ pub fn fix_popup() {
         }
         Err(_) => debug_print("  [✗] IDM registry path not found."),
     }
+
+    // 2. Neutralize IDMGrHlp.exe
+    neutralize_idmgrhlp();
+}
+
+pub fn neutralize_idmgrhlp() {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let idm_path = match hkcu.open_subkey(r"Software\DownloadManager") {
+        Ok(key) => key
+            .get_value::<String, _>("ExePath")
+            .map(|p| {
+                std::path::Path::new(&p)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(""))
+                    .to_path_buf()
+            })
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+
+    if idm_path.as_os_str().is_empty() {
+        return;
+    }
+
+    let integrator_path = idm_path.join("IDMGrHlp.exe");
+    if integrator_path.exists() {
+        // Check size
+        if let Ok(metadata) = std::fs::metadata(&integrator_path) {
+            if metadata.len() == 0 {
+                debug_print("  [✓] IDMGrHlp.exe is already neutralized.");
+                return;
+            }
+        }
+
+        debug_print(&format!("  [⟳] Neutralizing: {}", integrator_path.display()));
+
+        kill_idm();
+
+        let backup_path = idm_path.join("IDMGrHlp.exe.bak");
+        let integrator_str = integrator_path.to_string_lossy();
+
+        // 1. Take ownership and grant full access via cmd to avoid access denied
+        let _ = crate::hidden_command("takeown")
+            .args(["/F", &integrator_str])
+            .output();
+        let _ = crate::hidden_command("icacls")
+            .args([&integrator_str, "/grant", "administrators:F", "/Q"])
+            .output();
+
+        // 2. Manage backup via Rust native for reliability
+        if backup_path.exists() {
+            let _ = std::fs::remove_file(&backup_path);
+        }
+
+        // 3. Rename current to backup
+        match std::fs::rename(&integrator_path, &backup_path) {
+            Ok(_) => debug_print("  [✓] IDMGrHlp.exe renamed to .bak"),
+            Err(e) => {
+                debug_print(&format!("  [✗] Failed to rename: {}", e));
+                // Force copy and delete
+                if std::fs::copy(&integrator_path, &backup_path).is_ok() {
+                    let _ = std::fs::remove_file(&integrator_path);
+                }
+            }
+        }
+
+        // 4. Create empty file and lock it
+        match std::fs::write(&integrator_path, "") {
+            Ok(_) => {
+                let _ = crate::hidden_command("icacls")
+                    .args([&integrator_str, "/deny", "Everyone:(W)", "/Q"])
+                    .output();
+                debug_print("  [✓] IDMGrHlp.exe neutralized/replaced.");
+            }
+            Err(e) => debug_print(&format!("  [✗] Failed to write 0-byte file: {}", e)),
+        }
+    }
 }
 
 
@@ -103,7 +180,7 @@ pub fn fix_popup() {
 // ─────────────────────────────────────────────────────────────
 
 fn kill_idm() {
-    let processes = ["idman.exe"];
+    let processes = ["idman.exe", "IDMGrHlp.exe"];
     let mut killed_any = false;
 
     for proc in processes {
