@@ -168,7 +168,7 @@ impl eframe::App for MaintenanceApp {
             let full_rect = ui.available_rect_before_wrap();
 
             // ── Top accent gradient bar ──
-            let bar_height = 3.0;
+            let bar_height = 2.0;
             let bar_rect = egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), bar_height));
             let painter = ui.painter();
             let steps = 40;
@@ -185,25 +185,24 @@ impl eframe::App for MaintenanceApp {
             }
 
             // ── Content area ──
-            let content_rect = full_rect.shrink2(egui::vec2(24.0, 0.0));
+            let content_rect = full_rect.shrink2(egui::vec2(14.0, 0.0));
             let content_rect = egui::Rect::from_min_max(
-                egui::pos2(content_rect.min.x, content_rect.min.y + bar_height + 12.0),
+                egui::pos2(content_rect.min.x, content_rect.min.y + bar_height + 6.0),
                 content_rect.max,
             );
 
             ui.allocate_ui_at_rect(content_rect, |ui| {
                 ui.style_mut().visuals.override_text_color = Some(TEXT_PRIMARY);
-                ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
 
                 // ── Header ──
                 ui.vertical_centered(|ui| {
                     ui.label(
                         egui::RichText::new("SYSTEM OPTIMIZER")
-                            .size(16.0)
+                            .size(13.0)
                             .strong()
                             .color(TEXT_PRIMARY),
                     );
-                    ui.add_space(1.0);
                     let subtitle = if progress >= 1.0 {
                         "All tasks completed"
                     } else {
@@ -211,23 +210,23 @@ impl eframe::App for MaintenanceApp {
                     };
                     ui.label(
                         egui::RichText::new(subtitle)
-                            .size(10.5)
+                            .size(9.0)
                             .color(TEXT_SECONDARY),
                     );
                 });
 
-                ui.add_space(12.0);
+                ui.add_space(4.0);
 
                 // ── Progress Ring ──
                 ui.vertical_centered(|ui| {
-                    let ring_size = 90.0;
+                    let ring_size = 64.0;
                     let (rect, _) = ui.allocate_exact_size(
                         egui::vec2(ring_size, ring_size),
                         egui::Sense::hover(),
                     );
                     let center = rect.center();
-                    let radius = ring_size / 2.0 - 8.0;
-                    let thickness = 4.5;
+                    let radius = ring_size / 2.0 - 6.0;
+                    let thickness = 3.5;
                     let painter = ui.painter();
 
                     // Track
@@ -241,7 +240,7 @@ impl eframe::App for MaintenanceApp {
                             let pulse = ((t * 1.5).sin() * 0.3 + 0.7).clamp(0.4, 1.0);
                             lerp_color(ACCENT_3, ACCENT_1, pulse)
                         };
-                        draw_arc(painter, center, radius, thickness + 1.5, 0.0, progress, arc_col);
+                        draw_arc(painter, center, radius, thickness + 1.0, 0.0, progress, arc_col);
 
                         // Glow tip
                         if progress < 1.0 {
@@ -250,7 +249,7 @@ impl eframe::App for MaintenanceApp {
                             let glow = ((t * 3.0).sin() * 0.35 + 0.65).clamp(0.3, 1.0);
                             painter.circle_filled(
                                 tip,
-                                4.5,
+                                3.5,
                                 egui::Color32::from_rgba_premultiplied(
                                     arc_col.r(), arc_col.g(), arc_col.b(), (glow * 220.0) as u8,
                                 ),
@@ -262,25 +261,25 @@ impl eframe::App for MaintenanceApp {
                     let pct = (progress * 100.0) as u32;
                     let pct_col = if pct == 100 { SUCCESS } else { TEXT_PRIMARY };
                     painter.text(
-                        egui::pos2(center.x, center.y - 4.0),
+                        egui::pos2(center.x, center.y - 3.0),
                         egui::Align2::CENTER_CENTER,
                         format!("{}%", pct),
-                        egui::FontId::proportional(22.0),
+                        egui::FontId::proportional(16.0),
                         pct_col,
                     );
                     painter.text(
-                        egui::pos2(center.x, center.y + 14.0),
+                        egui::pos2(center.x, center.y + 10.0),
                         egui::Align2::CENTER_CENTER,
                         format!("{}s", elapsed),
-                        egui::FontId::proportional(9.5),
+                        egui::FontId::proportional(8.5),
                         TEXT_MUTED,
                     );
                 });
 
-                ui.add_space(12.0);
+                ui.add_space(4.0);
 
                 // ── Horizontal progress bar ──
-                let bar_h = 4.0;
+                let bar_h = 3.0;
                 let (bar_rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), bar_h),
                     egui::Sense::hover(),
@@ -296,7 +295,7 @@ impl eframe::App for MaintenanceApp {
                     }
                 }
 
-                ui.add_space(14.0);
+                ui.add_space(6.0);
 
                 // ── Phase List ──
                 for (i, phase) in phases.iter().enumerate() {
@@ -313,12 +312,12 @@ impl eframe::App for MaintenanceApp {
 
                     let card = egui::Frame::none()
                         .fill(bg)
-                        .rounding(egui::Rounding::same(8.0))
+                        .rounding(egui::Rounding::same(6.0))
                         .inner_margin(egui::Margin {
-                            left: 12.0,
-                            right: 12.0,
-                            top: if phase.detail.is_empty() { 8.0 } else { 7.0 },
-                            bottom: if phase.detail.is_empty() { 8.0 } else { 7.0 },
+                            left: 8.0,
+                            right: 8.0,
+                            top: if phase.detail.is_empty() { 5.0 } else { 4.0 },
+                            bottom: if phase.detail.is_empty() { 5.0 } else { 4.0 },
                         })
                         .stroke(egui::Stroke::new(
                             if is_active { 1.0 } else { 0.5 },
@@ -339,16 +338,16 @@ impl eframe::App for MaintenanceApp {
                                 };
                                 ui.label(
                                     egui::RichText::new(icon)
-                                        .size(if is_done { 12.0 } else { 14.0 })
+                                        .size(if is_done { 10.0 } else { 11.0 })
                                         .strong()
                                         .color(icon_col),
                                 );
 
-                                ui.add_space(6.0);
+                                ui.add_space(4.0);
 
                                 // Name
                                 let mut name_rt = egui::RichText::new(phase.name)
-                                    .size(12.0)
+                                    .size(10.5)
                                     .color(text_col);
                                 if is_active {
                                     name_rt = name_rt.strong();
@@ -361,12 +360,12 @@ impl eframe::App for MaintenanceApp {
                                         // Pill badge
                                         let pill = egui::Frame::none()
                                             .fill(egui::Color32::from_rgba_premultiplied(52, 211, 153, 25))
-                                            .rounding(egui::Rounding::same(10.0))
-                                            .inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 2.0, bottom: 2.0 });
+                                            .rounding(egui::Rounding::same(8.0))
+                                            .inner_margin(egui::Margin { left: 6.0, right: 6.0, top: 1.0, bottom: 1.0 });
                                         pill.show(ui, |ui| {
                                             ui.label(
                                                 egui::RichText::new("DONE")
-                                                    .size(8.5)
+                                                    .size(7.5)
                                                     .strong()
                                                     .color(SUCCESS),
                                             );
@@ -379,13 +378,13 @@ impl eframe::App for MaintenanceApp {
                                         }).collect::<Vec<_>>().iter().collect();
                                         ui.label(
                                             egui::RichText::new(dots)
-                                                .size(8.0)
+                                                .size(7.0)
                                                 .color(RUNNING_GLOW),
                                         );
                                     } else {
                                         ui.label(
                                             egui::RichText::new(format!("{}/{}", i + 1, phases.len()))
-                                                .size(9.0)
+                                                .size(8.0)
                                                 .color(TEXT_MUTED),
                                         );
                                     }
@@ -396,10 +395,10 @@ impl eframe::App for MaintenanceApp {
                             if !phase.detail.is_empty() {
                                 ui.add_space(2.0);
                                 ui.horizontal(|ui| {
-                                    ui.add_space(22.0); // align with name
+                                    ui.add_space(16.0); // align with name
                                     ui.label(
                                         egui::RichText::new(&phase.detail)
-                                            .size(9.5)
+                                            .size(8.5)
                                             .color(TEXT_SECONDARY)
                                             .italics(),
                                     );
@@ -411,32 +410,32 @@ impl eframe::App for MaintenanceApp {
                     // Left accent bar
                     let r = resp.response.rect;
                     ui.painter().rect_filled(
-                        egui::Rect::from_min_size(r.min, egui::vec2(3.0, r.height())),
-                        egui::Rounding { nw: 8.0, sw: 8.0, ne: 0.0, se: 0.0 },
+                        egui::Rect::from_min_size(r.min, egui::vec2(2.5, r.height())),
+                        egui::Rounding { nw: 6.0, sw: 6.0, ne: 0.0, se: 0.0 },
                         accent,
                     );
 
-                    ui.add_space(2.0);
+                    ui.add_space(1.0);
                 }
 
                 // ── Cleanup Stats Dashboard ──
                 if let Some(ref stats) = cleanup_stats {
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
 
                     let dash = egui::Frame::none()
                         .fill(egui::Color32::from_rgb(12, 20, 16))
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::same(10.0))
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::same(7.0))
                         .stroke(egui::Stroke::new(0.5, egui::Color32::from_rgb(30, 60, 40)));
 
                     dash.show(ui, |ui| {
                         ui.horizontal(|ui| {
                             // Freed
                             stat_chip(ui, "FREED", &cleanup::format_bytes(stats.bytes_freed), SUCCESS);
-                            ui.add_space(12.0);
+                            ui.add_space(8.0);
                             // Files
                             stat_chip(ui, "FILES", &stats.deleted.to_string(), ACCENT_3);
-                            ui.add_space(12.0);
+                            ui.add_space(8.0);
                             // Skipped
                             stat_chip(ui, "SKIPPED", &stats.failed.to_string(), WARN);
                         });
@@ -444,11 +443,11 @@ impl eframe::App for MaintenanceApp {
                 }
 
                 // ── Footer ──
-                ui.add_space(10.0);
+                ui.add_space(4.0);
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        egui::RichText::new("⚡ Built with Rust  ·  github.com/hamza-op")
-                            .size(9.0)
+                        egui::RichText::new("⚡ Built with Rust · github.com/hamza-op")
+                            .size(8.0)
                             .color(TEXT_MUTED),
                     );
                 });
@@ -490,13 +489,13 @@ fn stat_chip(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) 
     ui.vertical(|ui| {
         ui.label(
             egui::RichText::new(label)
-                .size(8.0)
+                .size(7.0)
                 .strong()
                 .color(TEXT_MUTED),
         );
         ui.label(
             egui::RichText::new(value)
-                .size(13.0)
+                .size(11.0)
                 .strong()
                 .color(color),
         );
@@ -657,7 +656,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([360.0, 530.0])
+            .with_inner_size([310.0, 400.0])
             .with_resizable(false)
             .with_always_on_top()
             .with_title("System Optimizer"),
