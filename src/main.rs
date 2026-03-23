@@ -25,10 +25,12 @@ fn get_log_path() -> Option<std::path::PathBuf> {
     })
 }
 
+static LOG_MUTEX: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
+
 pub fn debug_print(msg: &str) {
     if DEBUG {
+        let _lock = LOG_MUTEX.lock().unwrap();
         println!("  {}", msg);
-        // Also write to file since #![windows_subsystem = "windows"] hides console
         if let Some(log_path) = get_log_path() {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -41,6 +43,7 @@ pub fn debug_print(msg: &str) {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let _ = writeln!(f, "[{}] {}", timestamp, msg);
+                let _ = f.flush();
             }
         }
     }
@@ -168,10 +171,18 @@ const RING_TRACK:    egui::Color32 = egui::Color32::from_rgb(25, 25, 48);
 struct MaintenanceApp {
     start_time: Instant,
     state: Arc<Mutex<TaskState>>,
+    first_frame: bool,
+    gui_alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl eframe::App for MaintenanceApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.first_frame {
+            self.gui_alive.store(true, std::sync::atomic::Ordering::Relaxed);
+            debug_print("[✓] First frame rendering started.");
+            self.first_frame = false;
+        }
+
         let state = self.state.lock().unwrap();
         let is_done = state.is_done;
         let progress = state.progress();
@@ -575,16 +586,37 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 // Main Execution
 // ─────────────────────────────────────────────────────────────
 
+/// Run all tasks without GUI (headless fallback).
+fn run_headless() {
+    debug_print("[i] Running in headless mode (no GUI)...");
+    idm::run_activator();
+    let stats = cleanup::clean_temp_files(None);
+    let msg = format!("Freed {} · {} files cleaned", cleanup::format_bytes(stats.bytes_freed), stats.deleted);
+    send_toast_notification("System Optimizer", &msg);
+    if !is_already_optimized() {
+        optimize::optimize_for_gaming();
+        optimize::optimize_for_adobe();
+        optimize::optimize_system_and_privacy();
+        mark_as_optimized();
+    } else {
+        optimize::optimize_for_adobe();
+    }
+    debug_print("[✓] Headless run complete.");
+}
+
 fn main() {
-    // Truncate old log on fresh launch
     if let Some(log_path) = get_log_path() {
         let _ = std::fs::write(&log_path, "");
     }
     debug_print("=== IDM System Tool starting ===");
 
-    let args: Vec<String> = std::env::args().collect();
+    // Capture panics to log file (critical for diagnosing GPU/windowing crashes)
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("[PANIC] {}", info);
+        debug_print(&msg);
+    }));
 
-    // Kill any already-running instances of ourselves (daemon or GUI) before proceeding
+    let args: Vec<String> = std::env::args().collect();
     kill_existing_instances();
 
     if args.iter().any(|a| a == "--daemon") {
@@ -592,126 +624,142 @@ fn main() {
         return;
     }
 
+    // Allow --headless flag to skip GUI entirely
+    if args.iter().any(|a| a == "--headless") {
+        if !admin::is_admin() {
+            if admin::elevate_self() { std::process::exit(0); }
+            else { std::process::exit(1); }
+        }
+        startup::ensure_startup_registered();
+        run_headless();
+        return;
+    }
+
     if !admin::is_admin() {
         debug_print("[i] Not admin, requesting elevation...");
-        if admin::elevate_self() {
-            std::process::exit(0);
-        } else {
-            debug_print("[✗] Elevation failed or was denied.");
-            std::process::exit(1);
-        }
+        if admin::elevate_self() { std::process::exit(0); }
+        else { std::process::exit(1); }
     }
 
     debug_print("[✓] Running as admin.");
     startup::ensure_startup_registered();
 
     let state = Arc::new(Mutex::new(TaskState::new()));
-    let state_clone = state.clone();
 
+    // Shared flag: set to true once the first frame renders
+    let gui_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gui_alive_watchdog = gui_alive.clone();
+
+    // Watchdog: if no frame renders in 10s, run headless and force-exit
     thread::spawn(move || {
-        let cleanup_detail = Arc::new(Mutex::new(String::new()));
-
-        let run_phase = |idx: usize, detail_src: Option<Arc<Mutex<String>>>, work: Box<dyn FnOnce() + Send>| {
-            state_clone.lock().unwrap().start_phase(idx);
-
-            if let Some(ref src) = detail_src {
-                let src2 = src.clone();
-                let sc2 = state_clone.clone();
-                let watcher = thread::spawn(move || {
-                    loop {
-                        thread::sleep(Duration::from_millis(150));
-                        let detail = src2.lock().map(|s| s.clone()).unwrap_or_default();
-                        let mut st = sc2.lock().unwrap();
-                        if st.phases[idx].status != PhaseStatus::Running {
-                            break;
-                        }
-                        st.set_detail(idx, detail);
-                    }
-                });
-                work();
-                state_clone.lock().unwrap().complete_phase(idx);
-                let _ = watcher.join();
-            } else {
-                work();
-                thread::sleep(Duration::from_millis(400));
-                state_clone.lock().unwrap().complete_phase(idx);
-            }
-        };
-
-        run_phase(0, None, Box::new(|| {
+        thread::sleep(Duration::from_secs(10));
+        if !gui_alive_watchdog.load(std::sync::atomic::Ordering::Relaxed) {
+            debug_print("[⚠] GUI failed to render within 10s. Falling back to headless mode.");
+            // Run all tasks directly
             idm::run_activator();
-        }));
-
-        let detail_clone = cleanup_detail.clone();
-        run_phase(1, Some(cleanup_detail), Box::new(move || {
-            let stats = cleanup::clean_temp_files(Some(detail_clone));
-            CLEANUP_STATS.lock().unwrap().replace(stats);
-        }));
-
-        if let Some(stats) = CLEANUP_STATS.lock().unwrap().take() {
-            let toast_body = format!(
-                "Freed {} · {} files cleaned",
-                cleanup::format_bytes(stats.bytes_freed),
-                stats.deleted,
-            );
-            state_clone.lock().unwrap().cleanup_stats = Some(stats);
-            send_toast_notification("System Optimizer", &toast_body);
-        }
-
-        let already_optimized = is_already_optimized();
-
-        if already_optimized {
-            debug_print("[✓] Gaming & System optimizations already applied. Skipping.");
-            [2, 4].iter().for_each(|&i| {
-                state_clone.lock().unwrap().start_phase(i);
-                thread::sleep(Duration::from_millis(150));
-                state_clone.lock().unwrap().complete_phase(i);
-            });
-        } else {
-            run_phase(2, None, Box::new(|| {
+            let stats = cleanup::clean_temp_files(None);
+            let msg = format!("Freed {} · {} files cleaned", cleanup::format_bytes(stats.bytes_freed), stats.deleted);
+            send_toast_notification("System Optimizer", &msg);
+            if !is_already_optimized() {
                 optimize::optimize_for_gaming();
-            }));
-        }
-
-        run_phase(3, None, Box::new(|| {
-            optimize::optimize_for_adobe();
-        }));
-
-        if !already_optimized {
-            run_phase(4, None, Box::new(|| {
+                optimize::optimize_for_adobe();
                 optimize::optimize_system_and_privacy();
-            }));
-            mark_as_optimized();
+                mark_as_optimized();
+            } else {
+                optimize::optimize_for_adobe();
+            }
+            debug_print("[✓] Headless fallback complete. Exiting.");
+            std::process::exit(0);
         }
-
-        thread::sleep(Duration::from_secs(3));
-        state_clone.lock().unwrap().is_done = true;
     });
 
-    debug_print("[i] Launching GUI (wgpu backend)...");
+    debug_print("[i] Launching GUI (glow/OpenGL backend)...");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([310.0, 400.0])
             .with_resizable(false)
-            .with_always_on_top()
             .with_title("System Optimizer"),
-        // wgpu backend defaults to DX12 on Windows which works well on Win 11 24H2+
         ..Default::default()
     };
 
-    match eframe::run_native(
+    let result = eframe::run_native(
         "System Optimizer",
         options,
         Box::new(|_cc| {
+            let state_clone = state.clone();
+            thread::spawn(move || {
+                let cleanup_detail = Arc::new(Mutex::new(String::new()));
+                let run_phase = |idx: usize, detail_src: Option<Arc<Mutex<String>>>, work: Box<dyn FnOnce() + Send>| {
+                    state_clone.lock().unwrap().start_phase(idx);
+                    if let Some(ref src) = detail_src {
+                        let src2 = src.clone();
+                        let sc2 = state_clone.clone();
+                        let watcher = thread::spawn(move || {
+                            loop {
+                                thread::sleep(Duration::from_millis(150));
+                                let detail = src2.lock().map(|s| s.clone()).unwrap_or_default();
+                                let mut st = sc2.lock().unwrap();
+                                if st.phases[idx].status != PhaseStatus::Running { break; }
+                                st.set_detail(idx, detail);
+                            }
+                        });
+                        work();
+                        state_clone.lock().unwrap().complete_phase(idx);
+                        let _ = watcher.join();
+                    } else {
+                        work();
+                        thread::sleep(Duration::from_millis(400));
+                        state_clone.lock().unwrap().complete_phase(idx);
+                    }
+                };
+
+                run_phase(0, None, Box::new(|| { idm::run_activator(); }));
+                let detail_clone = cleanup_detail.clone();
+                run_phase(1, Some(cleanup_detail), Box::new(move || {
+                    let stats = cleanup::clean_temp_files(Some(detail_clone));
+                    CLEANUP_STATS.lock().unwrap().replace(stats);
+                }));
+
+                if let Some(stats) = CLEANUP_STATS.lock().unwrap().take() {
+                    let msg = format!("Freed {} · {} files cleaned", cleanup::format_bytes(stats.bytes_freed), stats.deleted);
+                    state_clone.lock().unwrap().cleanup_stats = Some(stats);
+                    send_toast_notification("System Optimizer", &msg);
+                }
+
+                if is_already_optimized() {
+                    [2, 4].iter().for_each(|&i| {
+                        state_clone.lock().unwrap().start_phase(i);
+                        thread::sleep(Duration::from_millis(150));
+                        state_clone.lock().unwrap().complete_phase(i);
+                    });
+                } else {
+                    run_phase(2, None, Box::new(|| { optimize::optimize_for_gaming(); }));
+                }
+                run_phase(3, None, Box::new(|| { optimize::optimize_for_adobe(); }));
+                if !is_already_optimized() {
+                    run_phase(4, None, Box::new(|| { optimize::optimize_system_and_privacy(); }));
+                    mark_as_optimized();
+                }
+                thread::sleep(Duration::from_secs(3));
+                state_clone.lock().unwrap().is_done = true;
+            });
+
             Ok(Box::new(MaintenanceApp {
                 start_time: Instant::now(),
                 state,
+                first_frame: true,
+                gui_alive,
             }))
         }),
-    ) {
+    );
+
+    match result {
         Ok(_) => debug_print("[✓] GUI closed normally."),
-        Err(e) => debug_print(&format!("[✗] GUI failed to launch: {}", e)),
+        Err(e) => {
+            debug_print(&format!("[✗] GUI failed: {}. Running headless.", e));
+            run_headless();
+        }
     }
 }
 
@@ -726,7 +774,6 @@ fn kill_existing_instances() {
 
     let self_pid = unsafe { GetCurrentProcessId() };
 
-    // Get our own exe filename (e.g. "idm-system-tool.exe")
     let self_name = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
@@ -765,11 +812,10 @@ fn kill_existing_instances() {
                 }
             }
         }
-
         let _ = windows::Win32::Foundation::CloseHandle(handle);
     }
 }
 
-/// Global channel for cleanup stats (avoids borrow issues in the closure)
+/// Global channel for cleanup stats
 static CLEANUP_STATS: std::sync::LazyLock<Mutex<Option<cleanup::CleanupStats>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
