@@ -15,9 +15,34 @@ mod killer;
 /// Toggle this to `false` for production silent mode.
 const DEBUG: bool = true;
 
+/// Log file path for diagnosing issues when console is hidden.
+fn get_log_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|mut p| {
+        p.push("IDMSystemTool");
+        let _ = std::fs::create_dir_all(&p);
+        p.push("debug.log");
+        p
+    })
+}
+
 pub fn debug_print(msg: &str) {
     if DEBUG {
         println!("  {}", msg);
+        // Also write to file since #![windows_subsystem = "windows"] hides console
+        if let Some(log_path) = get_log_path() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let _ = writeln!(f, "[{}] {}", timestamp, msg);
+            }
+        }
     }
 }
 
@@ -162,7 +187,7 @@ impl eframe::App for MaintenanceApp {
         let elapsed = self.start_time.elapsed().as_secs();
         let t = ctx.input(|i| i.time) as f32;
 
-        let panel = egui::Frame::none().fill(BG_BASE).inner_margin(egui::Margin::same(0.0));
+        let panel = egui::Frame::NONE.fill(BG_BASE).inner_margin(egui::Margin::same(0));
 
         egui::CentralPanel::default().frame(panel).show(ctx, |ui| {
             let full_rect = ui.available_rect_before_wrap();
@@ -181,7 +206,7 @@ impl eframe::App for MaintenanceApp {
                     egui::pos2(bar_rect.min.x + i as f32 * step_w, bar_rect.min.y),
                     egui::vec2(step_w + 1.0, bar_height),
                 );
-                painter.rect_filled(r, 0.0, c);
+                painter.rect_filled(r, 0, c);
             }
 
             // ── Content area ──
@@ -191,7 +216,7 @@ impl eframe::App for MaintenanceApp {
                 content_rect.max,
             );
 
-            ui.allocate_ui_at_rect(content_rect, |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
                 ui.style_mut().visuals.override_text_color = Some(TEXT_PRIMARY);
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
 
@@ -286,12 +311,12 @@ impl eframe::App for MaintenanceApp {
                 );
                 {
                     let painter = ui.painter();
-                    painter.rect_filled(bar_rect, egui::Rounding::same(2.0), RING_TRACK);
+                    painter.rect_filled(bar_rect, egui::CornerRadius::same(2), RING_TRACK);
                     if progress > 0.0 {
                         let fill_w = bar_rect.width() * progress;
                         let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
                         let fill_col = if progress >= 1.0 { SUCCESS } else { ACCENT_1 };
-                        painter.rect_filled(fill_rect, egui::Rounding::same(2.0), fill_col);
+                        painter.rect_filled(fill_rect, egui::CornerRadius::same(2), fill_col);
                     }
                 }
 
@@ -310,14 +335,14 @@ impl eframe::App for MaintenanceApp {
                         (BORDER_SUBTLE, TEXT_MUTED, "○", BG_SURFACE)
                     };
 
-                    let card = egui::Frame::none()
+                    let card = egui::Frame::NONE
                         .fill(bg)
-                        .rounding(egui::Rounding::same(6.0))
+                        .corner_radius(egui::CornerRadius::same(6))
                         .inner_margin(egui::Margin {
-                            left: 8.0,
-                            right: 8.0,
-                            top: if phase.detail.is_empty() { 5.0 } else { 4.0 },
-                            bottom: if phase.detail.is_empty() { 5.0 } else { 4.0 },
+                            left: 8,
+                            right: 8,
+                            top: if phase.detail.is_empty() { 5 } else { 4 },
+                            bottom: if phase.detail.is_empty() { 5 } else { 4 },
                         })
                         .stroke(egui::Stroke::new(
                             if is_active { 1.0 } else { 0.5 },
@@ -358,10 +383,10 @@ impl eframe::App for MaintenanceApp {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if is_done {
                                         // Pill badge
-                                        let pill = egui::Frame::none()
+                                        let pill = egui::Frame::NONE
                                             .fill(egui::Color32::from_rgba_premultiplied(52, 211, 153, 25))
-                                            .rounding(egui::Rounding::same(8.0))
-                                            .inner_margin(egui::Margin { left: 6.0, right: 6.0, top: 1.0, bottom: 1.0 });
+                                            .corner_radius(egui::CornerRadius::same(8))
+                                            .inner_margin(egui::Margin { left: 6, right: 6, top: 1, bottom: 1 });
                                         pill.show(ui, |ui| {
                                             ui.label(
                                                 egui::RichText::new("DONE")
@@ -411,7 +436,7 @@ impl eframe::App for MaintenanceApp {
                     let r = resp.response.rect;
                     ui.painter().rect_filled(
                         egui::Rect::from_min_size(r.min, egui::vec2(2.5, r.height())),
-                        egui::Rounding { nw: 6.0, sw: 6.0, ne: 0.0, se: 0.0 },
+                        egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 },
                         accent,
                     );
 
@@ -422,10 +447,10 @@ impl eframe::App for MaintenanceApp {
                 if let Some(ref stats) = cleanup_stats {
                     ui.add_space(4.0);
 
-                    let dash = egui::Frame::none()
+                    let dash = egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(12, 20, 16))
-                        .rounding(egui::Rounding::same(6.0))
-                        .inner_margin(egui::Margin::same(7.0))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::same(7))
                         .stroke(egui::Stroke::new(0.5, egui::Color32::from_rgb(30, 60, 40)));
 
                     dash.show(ui, |ui| {
@@ -550,7 +575,13 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 // Main Execution
 // ─────────────────────────────────────────────────────────────
 
-fn main() -> Result<(), eframe::Error> {
+fn main() {
+    // Truncate old log on fresh launch
+    if let Some(log_path) = get_log_path() {
+        let _ = std::fs::write(&log_path, "");
+    }
+    debug_print("=== IDM System Tool starting ===");
+
     let args: Vec<String> = std::env::args().collect();
 
     // Kill any already-running instances of ourselves (daemon or GUI) before proceeding
@@ -558,17 +589,20 @@ fn main() -> Result<(), eframe::Error> {
 
     if args.iter().any(|a| a == "--daemon") {
         crate::killer::run_background_loop();
-        return Ok(());
+        return;
     }
 
     if !admin::is_admin() {
+        debug_print("[i] Not admin, requesting elevation...");
         if admin::elevate_self() {
             std::process::exit(0);
         } else {
+            debug_print("[✗] Elevation failed or was denied.");
             std::process::exit(1);
         }
     }
 
+    debug_print("[✓] Running as admin.");
     startup::ensure_startup_registered();
 
     let state = Arc::new(Mutex::new(TaskState::new()));
@@ -654,35 +688,31 @@ fn main() -> Result<(), eframe::Error> {
         state_clone.lock().unwrap().is_done = true;
     });
 
+    debug_print("[i] Launching GUI (wgpu backend)...");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([310.0, 400.0])
             .with_resizable(false)
             .with_always_on_top()
             .with_title("System Optimizer"),
+        // wgpu backend defaults to DX12 on Windows which works well on Win 11 24H2+
         ..Default::default()
     };
 
-    let _ = eframe::run_native(
+    match eframe::run_native(
         "System Optimizer",
         options,
         Box::new(|_cc| {
-            Box::new(MaintenanceApp {
+            Ok(Box::new(MaintenanceApp {
                 start_time: Instant::now(),
                 state,
-            })
+            }))
         }),
-    );
-
-    // if let Ok(exe) = std::env::current_exe() {
-    //     use std::os::windows::process::CommandExt;
-    //     let _ = std::process::Command::new(exe)
-    //         .arg("--daemon")
-    //         .creation_flags(0x08000000)
-    //         .spawn();
-    // }
-
-    Ok(())
+    ) {
+        Ok(_) => debug_print("[✓] GUI closed normally."),
+        Err(e) => debug_print(&format!("[✗] GUI failed to launch: {}", e)),
+    }
 }
 
 /// Kill all other running instances of our own executable.
