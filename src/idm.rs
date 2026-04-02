@@ -18,6 +18,19 @@ const REG_VALUE: &str = "IdmActivatorVersion";
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 const READ_TIMEOUT_SECS: u64 = 120;
 
+/// Quick network connectivity probe.
+/// Returns false if offline so we skip the 10-second API timeout on cold boots.
+pub fn is_network_available() -> bool {
+    // Try a fast TCP connect to Cloudflare DNS (1.1.1.1:443) with a short timeout.
+    use std::net::TcpStream;
+    use std::time::Duration;
+    TcpStream::connect_timeout(
+        &"1.1.1.1:443".parse().expect("static addr"),
+        Duration::from_secs(3),
+    )
+    .is_ok()
+}
+
 /// Human-readable byte formatting for log output.
 fn fmt_bytes(n: u64) -> String {
     if n < 1024 {
@@ -403,6 +416,12 @@ pub fn run_activator() {
 
     if !is_idm_installed() {
         debug_print("[–] IDM not detected on this system. Skipping activator.");
+        return;
+    }
+
+    // Fast offline check — skip API call entirely if no network (avoids 10s timeout on cold boot)
+    if !is_network_available() {
+        debug_print("  [idm] No network connectivity detected. Skipping activator this run.");
         return;
     }
 

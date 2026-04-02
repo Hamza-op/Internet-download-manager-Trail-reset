@@ -14,9 +14,31 @@ pub struct CleanupStats {
     pub bytes_freed: u64,
 }
 
+/// Get available disk space on C: in bytes via PowerShell (no extra deps).
+fn available_bytes_on_c() -> Option<u64> {
+    let output = crate::hidden_command("powershell")
+        .args(&[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-PSDrive C).Free",
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 /// Clean temporary files from common Windows temp directories.
 /// Accepts an optional progress callback to report sub-progress text.
 pub fn clean_temp_files(progress: Option<Arc<Mutex<String>>>) -> CleanupStats {
+    // Log disk space before cleanup for user reference
+    if let Some(free) = available_bytes_on_c() {
+        debug_print(&format!("  [i] C:\\ free space before cleanup: {}", format_bytes(free)));
+    }
+
     let temp_dirs = get_temp_dirs();
     let total_dirs = temp_dirs.iter().filter(|d| d.exists()).count();
 
@@ -34,7 +56,6 @@ pub fn clean_temp_files(progress: Option<Arc<Mutex<String>>>) -> CleanupStats {
         .fold((0u64, 0u64, 0u64), |(acc_del, acc_fail, acc_bytes), dir| {
             completed += 1;
 
-            // Push sub-progress update
             if let Some(ref p) = progress {
                 let label = dir
                     .file_name()
@@ -46,14 +67,10 @@ pub fn clean_temp_files(progress: Option<Arc<Mutex<String>>>) -> CleanupStats {
             }
 
             debug_print(&format!("  [⟳] Cleaning: {}", dir.display()));
-
             let (deleted, failed, bytes) = clean_directory(dir);
-
             debug_print(&format!(
                 "      ✓ Deleted: {}  ✗ Failed: {}  Freed: {}",
-                deleted,
-                failed,
-                format_bytes(bytes)
+                deleted, failed, format_bytes(bytes)
             ));
 
             (acc_del + deleted, acc_fail + failed, acc_bytes + bytes)
@@ -61,10 +78,13 @@ pub fn clean_temp_files(progress: Option<Arc<Mutex<String>>>) -> CleanupStats {
 
     debug_print(&format!(
         "  Total: {} deleted | {} failed | {} freed",
-        total_deleted,
-        total_failed,
-        format_bytes(total_bytes_freed)
+        total_deleted, total_failed, format_bytes(total_bytes_freed)
     ));
+
+    // Log disk space after cleanup
+    if let Some(free) = available_bytes_on_c() {
+        debug_print(&format!("  [i] C:\\ free space after cleanup: {}", format_bytes(free)));
+    }
 
     CleanupStats {
         deleted: total_deleted,
@@ -74,6 +94,8 @@ pub fn clean_temp_files(progress: Option<Arc<Mutex<String>>>) -> CleanupStats {
 }
 
 /// Get list of temporary directories to clean.
+/// NOTE: Prefetch is intentionally excluded — clearing it slows the next boot.
+/// NOTE: Recent files are excluded — they are user data (used by Jump Lists).
 fn get_temp_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
@@ -87,19 +109,6 @@ fn get_temp_dirs() -> Vec<PathBuf> {
     // Windows\Temp
     if let Ok(windir) = std::env::var("SystemRoot") {
         dirs.push(PathBuf::from(format!("{}\\Temp", windir)));
-    }
-
-    // Prefetch (requires admin — we have it)
-    if let Ok(windir) = std::env::var("SystemRoot") {
-        dirs.push(PathBuf::from(format!("{}\\Prefetch", windir)));
-    }
-
-    // Recent files
-    if let Some(user_profile) = dirs::home_dir() {
-        let recent = user_profile.join("AppData\\Roaming\\Microsoft\\Windows\\Recent");
-        if recent.exists() {
-            dirs.push(recent);
-        }
     }
 
     // Windows Update cache

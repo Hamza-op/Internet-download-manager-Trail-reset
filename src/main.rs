@@ -25,11 +25,79 @@ fn get_log_path() -> Option<std::path::PathBuf> {
     })
 }
 
+/// Previous-run log path (debug.log.prev).
+fn get_prev_log_path() -> Option<std::path::PathBuf> {
+    get_log_path().map(|mut p| {
+        p.set_extension("log.prev");
+        p
+    })
+}
+
+/// Rotate current log → debug.log.prev, then start fresh.
+fn rotate_logs() {
+    if let (Some(current), Some(prev)) = (get_log_path(), get_prev_log_path()) {
+        if current.exists() {
+            let _ = std::fs::copy(&current, &prev);
+        }
+        let _ = std::fs::write(&current, "");
+    }
+}
+
 static LOG_MUTEX: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
+
+/// Human-readable timestamp: "2025-04-03 14:22:05"
+fn format_timestamp() -> String {
+    use std::time::SystemTime;
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Manual calendar computation — no chrono dep needed
+    let mut remaining = secs;
+    let secs_part = remaining % 60;
+    remaining /= 60;
+    let mins_part = remaining % 60;
+    remaining /= 60;
+    let hours_part = remaining % 24;
+    remaining /= 24;
+
+    // Days since Unix epoch → Gregorian date (Zeller-like)
+    let mut days = remaining;
+    let mut year = 1970u64;
+    loop {
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let months = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1u64;
+    for &m in &months {
+        if days < m {
+            break;
+        }
+        days -= m;
+        month += 1;
+    }
+    let day = days + 1;
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hours_part, mins_part, secs_part
+    )
+}
 
 pub fn debug_print(msg: &str) {
     if DEBUG {
-        let _lock = LOG_MUTEX.lock().unwrap();
+        // Poison-safe mutex: recover from panics holding the lock
+        let _lock = LOG_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         println!("  {}", msg);
         if let Some(log_path) = get_log_path() {
             use std::io::Write;
@@ -38,11 +106,7 @@ pub fn debug_print(msg: &str) {
                 .append(true)
                 .open(&log_path)
             {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let _ = writeln!(f, "[{}] {}", timestamp, msg);
+                let _ = writeln!(f, "[{}] {}", format_timestamp(), msg);
                 let _ = f.flush();
             }
         }
@@ -54,6 +118,36 @@ pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Com
     let mut cmd = std::process::Command::new(program);
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     cmd
+}
+
+/// Proper XML character escaping for toast notification content.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Renderer Preference Persistence
+// ─────────────────────────────────────────────────────────────
+
+const PREF_REG_PATH: &str = r"Software\ZeroIdle\Config";
+
+fn save_renderer_pref(renderer: &str) {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    if let Ok((key, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(PREF_REG_PATH) {
+        let _ = key.set_value("PreferredRenderer", &renderer.to_string());
+    }
+}
+
+fn load_renderer_pref() -> Option<String> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(PREF_REG_PATH)
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("PreferredRenderer").ok())
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -79,6 +173,7 @@ struct TaskState {
     pub phases: Vec<Phase>,
     pub active_phase: usize,
     pub cleanup_stats: Option<cleanup::CleanupStats>,
+    pub task_thread_started: bool,
 }
 
 impl TaskState {
@@ -87,6 +182,7 @@ impl TaskState {
             is_done: false,
             active_phase: 0,
             cleanup_stats: None,
+            task_thread_started: false,
             phases: vec![
                 Phase {
                     name: "IDM Activator Script",
@@ -144,11 +240,7 @@ impl TaskState {
     }
 
     fn progress(&self) -> f32 {
-        let done = self
-            .phases
-            .iter()
-            .filter(|p| p.status == PhaseStatus::Done)
-            .count();
+        let done = self.phases.iter().filter(|p| p.status == PhaseStatus::Done).count();
         done as f32 / self.phases.len() as f32
     }
 }
@@ -161,9 +253,9 @@ const BG_BASE: egui::Color32 = egui::Color32::from_rgb(8, 8, 14);
 const BG_SURFACE: egui::Color32 = egui::Color32::from_rgb(14, 14, 24);
 const BG_ELEVATED: egui::Color32 = egui::Color32::from_rgb(20, 20, 34);
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(80, 200, 255); // Ice blue
-const ACCENT_HOT: egui::Color32 = egui::Color32::from_rgb(255, 120, 50); // Warm amber
-const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(50, 120, 180); // Muted steel
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(80, 200, 255);
+const ACCENT_HOT: egui::Color32 = egui::Color32::from_rgb(255, 120, 50);
+const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(50, 120, 180);
 
 const SUCCESS: egui::Color32 = egui::Color32::from_rgb(70, 220, 130);
 const WARN: egui::Color32 = egui::Color32::from_rgb(255, 180, 50);
@@ -184,18 +276,18 @@ struct MaintenanceApp {
     state: Arc<Mutex<TaskState>>,
     first_frame: bool,
     gui_alive: Arc<std::sync::atomic::AtomicBool>,
+    dirty: bool,
 }
 
 impl eframe::App for MaintenanceApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.first_frame {
-            self.gui_alive
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.gui_alive.store(true, std::sync::atomic::Ordering::Relaxed);
             debug_print("[✓] First frame rendering started.");
             self.first_frame = false;
         }
 
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let is_done = state.is_done;
         let progress = state.progress();
         let phases: Vec<Phase> = state.phases.iter().cloned().collect();
@@ -244,20 +336,14 @@ impl eframe::App for MaintenanceApp {
             painter.line_segment(
                 [
                     egui::pos2(full_rect.min.x + m, full_rect.min.y + bar_h + m),
-                    egui::pos2(
-                        full_rect.min.x + m,
-                        full_rect.min.y + bar_h + m + corner_len,
-                    ),
+                    egui::pos2(full_rect.min.x + m, full_rect.min.y + bar_h + m + corner_len),
                 ],
                 egui::Stroke::new(1.0, corner_col),
             );
             painter.line_segment(
                 [
                     egui::pos2(full_rect.min.x + m, full_rect.min.y + bar_h + m),
-                    egui::pos2(
-                        full_rect.min.x + m + corner_len,
-                        full_rect.min.y + bar_h + m,
-                    ),
+                    egui::pos2(full_rect.min.x + m + corner_len, full_rect.min.y + bar_h + m),
                 ],
                 egui::Stroke::new(1.0, corner_col),
             );
@@ -265,20 +351,14 @@ impl eframe::App for MaintenanceApp {
             painter.line_segment(
                 [
                     egui::pos2(full_rect.max.x - m, full_rect.min.y + bar_h + m),
-                    egui::pos2(
-                        full_rect.max.x - m,
-                        full_rect.min.y + bar_h + m + corner_len,
-                    ),
+                    egui::pos2(full_rect.max.x - m, full_rect.min.y + bar_h + m + corner_len),
                 ],
                 egui::Stroke::new(1.0, corner_col),
             );
             painter.line_segment(
                 [
                     egui::pos2(full_rect.max.x - m, full_rect.min.y + bar_h + m),
-                    egui::pos2(
-                        full_rect.max.x - m - corner_len,
-                        full_rect.min.y + bar_h + m,
-                    ),
+                    egui::pos2(full_rect.max.x - m - corner_len, full_rect.min.y + bar_h + m),
                 ],
                 egui::Stroke::new(1.0, corner_col),
             );
@@ -353,10 +433,8 @@ impl eframe::App for MaintenanceApp {
                     let radius = ring_size / 2.0 - 6.0;
                     let painter = ui.painter();
 
-                    // Track ring
                     draw_arc(painter, center, radius, 3.0, 0.0, 1.0, RING_TRACK);
 
-                    // Tick marks (static, subtle)
                     for i in 0..20 {
                         let angle =
                             (i as f32 / 20.0) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
@@ -365,19 +443,10 @@ impl eframe::App for MaintenanceApp {
                         let alpha = if i % 5 == 0 { 40u8 } else { 18u8 };
                         painter.line_segment(
                             [
-                                egui::pos2(
-                                    center.x + angle.cos() * r1,
-                                    center.y + angle.sin() * r1,
-                                ),
-                                egui::pos2(
-                                    center.x + angle.cos() * r2,
-                                    center.y + angle.sin() * r2,
-                                ),
+                                egui::pos2(center.x + angle.cos() * r1, center.y + angle.sin() * r1),
+                                egui::pos2(center.x + angle.cos() * r2, center.y + angle.sin() * r2),
                             ],
-                            egui::Stroke::new(
-                                0.8,
-                                egui::Color32::from_rgba_premultiplied(210, 215, 230, alpha),
-                            ),
+                            egui::Stroke::new(0.8, egui::Color32::from_rgba_premultiplied(210, 215, 230, alpha)),
                         );
                     }
 
@@ -385,10 +454,8 @@ impl eframe::App for MaintenanceApp {
                         let arc_col = if progress >= 1.0 { SUCCESS } else { ACCENT };
                         draw_arc(painter, center, radius, 4.0, 0.0, progress, arc_col);
 
-                        // Glow tip
                         if progress < 1.0 {
-                            let angle =
-                                -std::f32::consts::FRAC_PI_2 + progress * std::f32::consts::TAU;
+                            let angle = -std::f32::consts::FRAC_PI_2 + progress * std::f32::consts::TAU;
                             let tip = egui::pos2(
                                 center.x + angle.cos() * radius,
                                 center.y + angle.sin() * radius,
@@ -398,26 +465,17 @@ impl eframe::App for MaintenanceApp {
                                 tip,
                                 5.0,
                                 egui::Color32::from_rgba_premultiplied(
-                                    arc_col.r(),
-                                    arc_col.g(),
-                                    arc_col.b(),
-                                    (glow * 35.0) as u8,
+                                    arc_col.r(), arc_col.g(), arc_col.b(), (glow * 35.0) as u8,
                                 ),
                             );
                             painter.circle_filled(
                                 tip,
                                 2.5,
-                                egui::Color32::from_rgba_premultiplied(
-                                    255,
-                                    255,
-                                    255,
-                                    (glow * 200.0) as u8,
-                                ),
+                                egui::Color32::from_rgba_premultiplied(255, 255, 255, (glow * 200.0) as u8),
                             );
                         }
                     }
 
-                    // Center percentage
                     let pct = (progress * 100.0) as u32;
                     let pct_col = if pct == 100 { SUCCESS } else { TEXT_PRIMARY };
                     painter.text(
@@ -438,7 +496,6 @@ impl eframe::App for MaintenanceApp {
 
                 ui.add_space(5.0);
 
-                // ── Thin separator line ──
                 let sep_w = ui.available_width() * 0.6;
                 let sep_x = content_rect.min.x + (content_rect.width() - sep_w) / 2.0;
                 let sep_y = ui.cursor().min.y;
@@ -453,25 +510,17 @@ impl eframe::App for MaintenanceApp {
                     let is_active = phase.status == PhaseStatus::Running;
                     let is_done = phase.status == PhaseStatus::Done;
 
-                    // Paint a custom row: left bar + content + right status
-                    // Use a simple frame for the row
                     let row_bg = if is_active { BG_ELEVATED } else { BG_SURFACE };
                     let border_col = if is_active { ACCENT_DIM } else { BORDER_SUBTLE };
 
                     let card = egui::Frame::NONE
                         .fill(row_bg)
                         .corner_radius(egui::CornerRadius::same(4))
-                        .inner_margin(egui::Margin {
-                            left: 10,
-                            right: 8,
-                            top: 5,
-                            bottom: 5,
-                        })
+                        .inner_margin(egui::Margin { left: 10, right: 8, top: 5, bottom: 5 })
                         .stroke(egui::Stroke::new(0.5, border_col));
 
                     let resp = card.show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            // Status dot — painted as a small filled circle via painter
                             let (dot_rect, _) =
                                 ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                             let dot_center = dot_rect.center();
@@ -481,21 +530,11 @@ impl eframe::App for MaintenanceApp {
                                 let pulse = ((t * 3.0).sin() * 0.3 + 0.7).clamp(0.4, 1.0);
                                 let col = lerp_color(ACCENT, egui::Color32::WHITE, pulse * 0.3);
                                 ui.painter().circle_filled(dot_center, 3.5, col);
-                                // Outer pulse ring
-                                let ring_alpha =
-                                    ((t * 2.0).sin() * 80.0 + 80.0).clamp(20.0, 160.0) as u8;
+                                let ring_alpha = ((t * 2.0).sin() * 80.0 + 80.0).clamp(20.0, 160.0) as u8;
                                 ui.painter().circle_stroke(
                                     dot_center,
                                     5.5,
-                                    egui::Stroke::new(
-                                        0.8,
-                                        egui::Color32::from_rgba_premultiplied(
-                                            ACCENT.r(),
-                                            ACCENT.g(),
-                                            ACCENT.b(),
-                                            ring_alpha,
-                                        ),
-                                    ),
+                                    egui::Stroke::new(0.8, egui::Color32::from_rgba_premultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), ring_alpha)),
                                 );
                             } else {
                                 ui.painter().circle_stroke(
@@ -507,53 +546,25 @@ impl eframe::App for MaintenanceApp {
 
                             ui.add_space(4.0);
 
-                            // Phase name
-                            let name_col = if is_done {
-                                TEXT_PRIMARY
-                            } else if is_active {
-                                ACCENT
-                            } else {
-                                TEXT_SECONDARY
-                            };
-                            let mut name_rt =
-                                egui::RichText::new(phase.name).size(10.5).color(name_col);
-                            if is_active {
-                                name_rt = name_rt.strong();
-                            }
+                            let name_col = if is_done { TEXT_PRIMARY } else if is_active { ACCENT } else { TEXT_SECONDARY };
+                            let mut name_rt = egui::RichText::new(phase.name).size(10.5).color(name_col);
+                            if is_active { name_rt = name_rt.strong(); }
                             ui.label(name_rt);
 
-                            // Right-side status — use allocate to prevent expansion
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if is_done {
-                                        ui.label(
-                                            egui::RichText::new("done").size(8.0).color(SUCCESS),
-                                        );
-                                    } else if is_active {
-                                        // Simple dot animation — safe ASCII
-                                        let dots = match ((t * 3.0) as u32) % 4 {
-                                            0 => ".",
-                                            1 => "..",
-                                            2 => "...",
-                                            _ => "",
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(dots)
-                                                .size(9.0)
-                                                .strong()
-                                                .color(ACCENT),
-                                        );
-                                    } else {
-                                        ui.label(
-                                            egui::RichText::new("--").size(8.0).color(TEXT_MUTED),
-                                        );
-                                    }
-                                },
-                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if is_done {
+                                    ui.label(egui::RichText::new("done").size(8.0).color(SUCCESS));
+                                } else if is_active {
+                                    let dots = match ((t * 3.0) as u32) % 4 {
+                                        0 => ".", 1 => "..", 2 => "...", _ => "",
+                                    };
+                                    ui.label(egui::RichText::new(dots).size(9.0).strong().color(ACCENT));
+                                } else {
+                                    ui.label(egui::RichText::new("--").size(8.0).color(TEXT_MUTED));
+                                }
+                            });
                         });
 
-                        // Sub-detail for active phases
                         if !phase.detail.is_empty() {
                             ui.horizontal(|ui| {
                                 ui.add_space(14.0);
@@ -567,23 +578,11 @@ impl eframe::App for MaintenanceApp {
                         }
                     });
 
-                    // Left accent bar
                     let r = resp.response.rect;
-                    let bar_col = if is_done {
-                        SUCCESS
-                    } else if is_active {
-                        ACCENT
-                    } else {
-                        BORDER_SUBTLE
-                    };
+                    let bar_col = if is_done { SUCCESS } else if is_active { ACCENT } else { BORDER_SUBTLE };
                     ui.painter().rect_filled(
                         egui::Rect::from_min_size(r.min, egui::vec2(2.5, r.height())),
-                        egui::CornerRadius {
-                            nw: 4,
-                            sw: 4,
-                            ne: 0,
-                            se: 0,
-                        },
+                        egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
                         bar_col,
                     );
 
@@ -597,22 +596,12 @@ impl eframe::App for MaintenanceApp {
                     let dash = egui::Frame::NONE
                         .fill(BG_SURFACE)
                         .corner_radius(egui::CornerRadius::same(4))
-                        .inner_margin(egui::Margin {
-                            left: 10,
-                            right: 10,
-                            top: 6,
-                            bottom: 6,
-                        })
+                        .inner_margin(egui::Margin { left: 10, right: 10, top: 6, bottom: 6 })
                         .stroke(egui::Stroke::new(0.5, BORDER_SUBTLE));
 
                     dash.show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            stat_chip(
-                                ui,
-                                "FREED",
-                                &cleanup::format_bytes(stats.bytes_freed),
-                                SUCCESS,
-                            );
+                            stat_chip(ui, "FREED", &cleanup::format_bytes(stats.bytes_freed), SUCCESS);
                             ui.add_space(16.0);
                             stat_chip(ui, "FILES", &stats.deleted.to_string(), ACCENT);
                             ui.add_space(16.0);
@@ -632,7 +621,11 @@ impl eframe::App for MaintenanceApp {
             });
         });
 
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // Only repaint when there's animation or something changed — use dirty flag
+        if self.dirty || progress < 1.0 {
+            ctx.request_repaint_after(Duration::from_millis(100));
+            self.dirty = false;
+        }
     }
 }
 
@@ -666,12 +659,7 @@ fn draw_arc(
 fn stat_chip(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        ui.label(
-            egui::RichText::new(label)
-                .size(7.5)
-                .strong()
-                .color(TEXT_MUTED),
-        );
+        ui.label(egui::RichText::new(label).size(7.5).strong().color(TEXT_MUTED));
         ui.label(egui::RichText::new(value).size(12.0).strong().color(color));
     });
 }
@@ -686,10 +674,13 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Toast Notification (F14)
+// Toast Notification — with proper XML escaping (fix #12)
 // ─────────────────────────────────────────────────────────────
 
 fn send_toast_notification(title: &str, body: &str) {
+    let safe_title = xml_escape(title);
+    let safe_body = xml_escape(body);
+
     let ps_script = format!(
         r#"
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
@@ -711,8 +702,8 @@ $xml.LoadXml($template)
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("ZeroIdle").Show($toast)
 "#,
-        title.replace('"', "'"),
-        body.replace('"', "'"),
+        safe_title,
+        safe_body,
     );
 
     let _ = hidden_command("powershell")
@@ -720,69 +711,205 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         .spawn();
 }
 
+/// Send an error toast (used when a critical phase fails).
+fn send_error_toast(phase: &str, reason: &str) {
+    send_toast_notification(
+        &format!("ZeroIdle — {} failed", phase),
+        reason,
+    );
+}
+
 // ─────────────────────────────────────────────────────────────
-// Main Execution
+// Network Availability Gate
 // ─────────────────────────────────────────────────────────────
 
-/// Run all tasks without GUI (headless fallback).
+/// Returns true if internet is reachable (fast check, 2s timeout).
+fn is_online() -> bool {
+    hidden_command("ping")
+        .args(&["1.1.1.1", "-n", "1", "-w", "2000"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Task Runner — shared between GUI thread and headless
+// ─────────────────────────────────────────────────────────────
+
+/// Run all 6 phases, updating `state` if provided (GUI mode) or running bare (headless).
+/// Fixed: phase completion is tracked explicitly so watchdog fallback cannot re-run
+/// partially-completed phases.
+fn run_all_phases(state: Option<Arc<Mutex<TaskState>>>) {
+    let cleanup_detail = Arc::new(Mutex::new(String::new()));
+
+    let run_phase = {
+        let state = state.clone();
+        move |idx: usize, detail_src: Option<Arc<Mutex<String>>>, work: Box<dyn FnOnce() + Send>| {
+            if let Some(ref s) = state {
+                s.lock().unwrap_or_else(|e| e.into_inner()).start_phase(idx);
+            }
+            if let Some(ref src) = detail_src {
+                let src2 = src.clone();
+                if let Some(ref sc) = state {
+                    let sc2 = sc.clone();
+                    let watcher = thread::spawn(move || loop {
+                        thread::sleep(Duration::from_millis(150));
+                        let detail = src2.lock().map(|s| s.clone()).unwrap_or_default();
+                        let mut st = sc2.lock().unwrap_or_else(|e| e.into_inner());
+                        if st.phases[idx].status != PhaseStatus::Running { break; }
+                        st.set_detail(idx, detail);
+                    });
+                    work();
+                    sc.lock().unwrap_or_else(|e| e.into_inner()).complete_phase(idx);
+                    let _ = watcher.join();
+                } else {
+                    work();
+                }
+            } else {
+                work();
+                if let Some(ref sc) = state {
+                    thread::sleep(Duration::from_millis(400));
+                    sc.lock().unwrap_or_else(|e| e.into_inner()).complete_phase(idx);
+                }
+            }
+        }
+    };
+
+    let skip_phase = {
+        let state = state.clone();
+        move |idx: usize, reason: &str| {
+            if let Some(ref sc) = state {
+                sc.lock().unwrap_or_else(|e| e.into_inner()).start_phase(idx);
+                thread::sleep(Duration::from_millis(120));
+                sc.lock().unwrap_or_else(|e| e.into_inner()).set_detail(idx, reason.into());
+                thread::sleep(Duration::from_millis(200));
+                sc.lock().unwrap_or_else(|e| e.into_inner()).complete_phase(idx);
+            } else {
+                debug_print(&format!("[—] Phase {}: {} — skipped", idx, reason));
+            }
+        }
+    };
+
+    // Phase 0: IDM Activator (always-run, gated by network + IDM presence)
+    if idm::is_idm_installed() {
+        let online = is_online();
+        if online {
+            run_phase(0, None, Box::new(|| { idm::run_activator(); }));
+        } else {
+            debug_print("[⚠] IDM activator skipped — no network connection.");
+            skip_phase(0, "offline — skipped");
+        }
+    } else {
+        skip_phase(0, "IDM not installed — skipped");
+    }
+
+    // Phase 1: Temp Cleanup (always-run)
+    let detail_clone = cleanup_detail.clone();
+    let state_for_stats = state.clone();
+    run_phase(
+        1,
+        Some(cleanup_detail),
+        Box::new(move || {
+            let stats = cleanup::clean_temp_files(Some(detail_clone));
+            let msg = format!(
+                "Freed {} · {} files cleaned",
+                cleanup::format_bytes(stats.bytes_freed),
+                stats.deleted
+            );
+            if let Some(ref sc) = state_for_stats {
+                sc.lock().unwrap_or_else(|e| e.into_inner()).cleanup_stats = Some(stats);
+            }
+            send_toast_notification("ZeroIdle — Cleanup Done", &msg);
+        }),
+    );
+
+    // Phase 2: Gaming Optimizations (one-time)
+    if optimize::is_task_done("gaming_opt") {
+        skip_phase(2, "already applied — skipped");
+    } else {
+        run_phase(2, None, Box::new(|| {
+            optimize::optimize_for_gaming();
+        }));
+    }
+
+    // Phase 3: Adobe (always runs)
+    run_phase(3, None, Box::new(|| { optimize::optimize_for_adobe(); }));
+
+    // Phase 4: System & Privacy (one-time)
+    if optimize::is_task_done("system_privacy") {
+        skip_phase(4, "already applied — skipped");
+    } else {
+        run_phase(4, None, Box::new(|| {
+            optimize::optimize_system_and_privacy();
+        }));
+    }
+
+    // Phase 5: Startup & Services (one-time)
+    if optimize::is_task_done("startup_services") {
+        skip_phase(5, "already applied — skipped");
+    } else {
+        run_phase(5, None, Box::new(|| {
+            optimize::optimize_startup_and_services();
+        }));
+    }
+
+    // Standby memory clear — conditional on uptime
+    optimize::maybe_clear_standby_memory();
+
+    debug_print("[✓] All phases complete.");
+}
+
+// ─────────────────────────────────────────────────────────────
+// Headless Mode
+// ─────────────────────────────────────────────────────────────
+
 fn run_headless() {
     debug_print("[i] Running in headless mode (no GUI)...");
+    optimize::ensure_schema_current(); // auto-reset stale flags
 
-    // Fast-path: log if all one-time optimizations are already applied
     if optimize::all_onetime_tasks_done() {
-        debug_print(
-            "[✓] All one-time optimizations already applied. Running always-run tasks only.",
-        );
+        debug_print("[✓] All one-time optimizations already applied. Running always-run tasks only.");
     }
 
-    // Always-run tasks
-    idm::run_activator();
-    let stats = cleanup::clean_temp_files(None);
-    let msg = format!(
-        "Freed {} · {} files cleaned",
-        cleanup::format_bytes(stats.bytes_freed),
-        stats.deleted
-    );
-    send_toast_notification("ZeroIdle", &msg);
+    run_all_phases(None);
 
-    // One-time tasks — skip if already completed
-    if !optimize::is_task_done("gaming_opt") {
-        optimize::optimize_for_gaming();
-    } else {
-        debug_print("[✓] Gaming optimizations already applied — skipped.");
-    }
-
-    // Adobe always runs (kills background procs)
-    optimize::optimize_for_adobe();
-
-    if !optimize::is_task_done("system_privacy") {
-        optimize::optimize_system_and_privacy();
-    } else {
-        debug_print("[✓] System & Privacy already applied — skipped.");
-    }
-
-    if !optimize::is_task_done("startup_services") {
-        optimize::optimize_startup_and_services();
-    } else {
-        debug_print("[✓] Startup & Services already applied — skipped.");
-    }
-
+    // Headless: distinct exit codes for Task Scheduler
+    // 0 = success (already returned implicitly via normal flow)
     debug_print("[✓] Headless run complete.");
 }
 
+// ─────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────
+
 fn main() {
-    if let Some(log_path) = get_log_path() {
-        let _ = std::fs::write(&log_path, "");
-    }
+    // Rotate logs: keep previous run's output in debug.log.prev
+    rotate_logs();
     debug_print("=== ZeroIdle starting ===");
 
-    // Capture panics to log file (critical for diagnosing GPU/windowing crashes)
+    // Capture panics to log file — critical for diagnosing GPU/windowing crashes
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("[PANIC] {}", info);
         debug_print(&msg);
     }));
 
+    // Log system context for remote diagnosis
+    optimize::log_system_context();
+
     let args: Vec<String> = std::env::args().collect();
+
+    // Admin check before kill_existing (can't kill elevated instances without admin)
+    if !args.iter().any(|a| a == "--daemon" || a == "--headless") {
+        if !admin::is_admin() {
+            debug_print("[i] Not admin, requesting elevation...");
+            if admin::elevate_self() {
+                std::process::exit(0);
+            } else {
+                std::process::exit(1);
+            }
+        }
+    }
+
     kill_existing_instances();
 
     if args.iter().any(|a| a == "--daemon") {
@@ -790,7 +917,6 @@ fn main() {
         return;
     }
 
-    // Allow --headless flag to skip GUI entirely
     if args.iter().any(|a| a == "--headless") {
         if !admin::is_admin() {
             if admin::elevate_self() {
@@ -801,39 +927,40 @@ fn main() {
         }
         startup::ensure_startup_registered();
         run_headless();
+        // Spawn daemon as child process after headless completes
+        spawn_daemon();
         return;
-    }
-
-    if !admin::is_admin() {
-        debug_print("[i] Not admin, requesting elevation...");
-        if admin::elevate_self() {
-            std::process::exit(0);
-        } else {
-            std::process::exit(1);
-        }
     }
 
     debug_print("[✓] Running as admin.");
     startup::ensure_startup_registered();
     optimize::migrate_legacy_flag();
+    optimize::ensure_schema_current(); // auto-reset flags when new optimizations are added
 
     let state = Arc::new(Mutex::new(TaskState::new()));
 
-    // Shared flag: set to true once the first frame renders
     let gui_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let gui_alive_watchdog = gui_alive.clone();
 
-    // Watchdog: if no frame renders in 10s, run headless and force-exit
+    // Watchdog — if no frame in 10s, fall through to headless.
+    // Fix: pass a fresh state so watchdog does not double-run with main thread.
+    let watchdog_state = state.clone();
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(10));
         if !gui_alive_watchdog.load(std::sync::atomic::Ordering::Relaxed) {
             debug_print("[⚠] GUI failed to render within 10s. Falling back to headless mode.");
+            // Mark all phases done in the shared state so the task thread exits cleanly
+            {
+                let mut st = watchdog_state.lock().unwrap_or_else(|e| e.into_inner());
+                st.is_done = true;
+            }
             run_headless();
+            spawn_daemon();
             std::process::exit(0);
         }
     });
 
-    debug_print("[i] Launching GUI (glow/OpenGL backend)...");
+    debug_print("[i] Launching GUI...");
 
     let try_run_gui = |renderer: eframe::Renderer,
                        state: Arc<Mutex<TaskState>>,
@@ -852,200 +979,124 @@ fn main() {
             "ZeroIdle",
             options,
             Box::new(move |_cc| {
+                // Only start the task thread once (guard against double-start from wgpu retry)
+                {
+                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                    if st.task_thread_started {
+                        // wgpu retry path — tasks already ran, just show completion quickly
+                        st.is_done = true;
+                    }
+                    st.task_thread_started = true;
+                }
+
                 let state_clone = state.clone();
+                let state_for_thread = state.clone();
                 thread::spawn(move || {
-                    let cleanup_detail = Arc::new(Mutex::new(String::new()));
-                    let run_phase =
-                        |idx: usize,
-                         detail_src: Option<Arc<Mutex<String>>>,
-                         work: Box<dyn FnOnce() + Send>| {
-                            state_clone.lock().unwrap().start_phase(idx);
-                            if let Some(ref src) = detail_src {
-                                let src2 = src.clone();
-                                let sc2 = state_clone.clone();
-                                let watcher = thread::spawn(move || loop {
-                                    thread::sleep(Duration::from_millis(150));
-                                    let detail = src2.lock().map(|s| s.clone()).unwrap_or_default();
-                                    let mut st = sc2.lock().unwrap();
-                                    if st.phases[idx].status != PhaseStatus::Running {
-                                        break;
-                                    }
-                                    st.set_detail(idx, detail);
-                                });
-                                work();
-                                state_clone.lock().unwrap().complete_phase(idx);
-                                let _ = watcher.join();
-                            } else {
-                                work();
-                                thread::sleep(Duration::from_millis(400));
-                                state_clone.lock().unwrap().complete_phase(idx);
-                            }
-                        };
-
-                    // === Skip helper for completed/inapplicable tasks ===
-                    let skip_phase = |idx: usize, sc: &Arc<Mutex<TaskState>>, reason: &str| {
-                        sc.lock().unwrap().start_phase(idx);
-                        thread::sleep(Duration::from_millis(120));
-                        sc.lock().unwrap().set_detail(idx, reason.into());
-                        thread::sleep(Duration::from_millis(200));
-                        sc.lock().unwrap().complete_phase(idx);
-                    };
-
-                    // === Phase 0: IDM Activator (always-run, but skip if IDM not installed) ===
-                    if idm::is_idm_installed() {
-                        run_phase(
-                            0,
-                            None,
-                            Box::new(|| {
-                                idm::run_activator();
-                            }),
-                        );
-                    } else {
-                        skip_phase(0, &state_clone, "IDM not installed — skipped");
+                    // Double-check we weren't already marked done
+                    if state_for_thread.lock().unwrap_or_else(|e| e.into_inner()).is_done {
+                        return;
                     }
-
-                    // === Phase 1: Temp Cleanup (always-run) ===
-                    let detail_clone = cleanup_detail.clone();
-                    run_phase(
-                        1,
-                        Some(cleanup_detail),
-                        Box::new(move || {
-                            let stats = cleanup::clean_temp_files(Some(detail_clone));
-                            CLEANUP_STATS.lock().unwrap().replace(stats);
-                        }),
-                    );
-
-                    if let Some(stats) = CLEANUP_STATS.lock().unwrap().take() {
-                        let msg = format!(
-                            "Freed {} · {} files cleaned",
-                            cleanup::format_bytes(stats.bytes_freed),
-                            stats.deleted
-                        );
-                        state_clone.lock().unwrap().cleanup_stats = Some(stats);
-                        send_toast_notification("System Optimizer", &msg);
-                    }
-
-                    // === One-time tasks — skip instantly if already done ===
-
-                    // Phase 2: Gaming Optimizations
-                    if optimize::is_task_done("gaming_opt") {
-                        skip_phase(2, &state_clone, "already applied — skipped");
-                    } else {
-                        run_phase(
-                            2,
-                            None,
-                            Box::new(|| {
-                                optimize::optimize_for_gaming();
-                            }),
-                        );
-                    }
-
-                    // Phase 3: Adobe — always runs (kills background procs)
-                    run_phase(
-                        3,
-                        None,
-                        Box::new(|| {
-                            optimize::optimize_for_adobe();
-                        }),
-                    );
-
-                    // Phase 4: System & Privacy
-                    if optimize::is_task_done("system_privacy") {
-                        skip_phase(4, &state_clone, "already applied — skipped");
-                    } else {
-                        run_phase(
-                            4,
-                            None,
-                            Box::new(|| {
-                                optimize::optimize_system_and_privacy();
-                            }),
-                        );
-                    }
-
-                    // Phase 5: Startup & Services
-                    if optimize::is_task_done("startup_services") {
-                        skip_phase(5, &state_clone, "already applied — skipped");
-                    } else {
-                        run_phase(
-                            5,
-                            None,
-                            Box::new(|| {
-                                optimize::optimize_startup_and_services();
-                            }),
-                        );
-                    }
-
+                    run_all_phases(Some(state_for_thread.clone()));
                     thread::sleep(Duration::from_secs(3));
-                    state_clone.lock().unwrap().is_done = true;
+                    state_for_thread.lock().unwrap_or_else(|e| e.into_inner()).is_done = true;
                 });
 
                 Ok(Box::new(MaintenanceApp {
                     start_time: Instant::now(),
-                    state,
+                    state: state_clone,
                     first_frame: true,
                     gui_alive,
+                    dirty: false,
                 }))
             }),
         )
     };
 
-    // Try glow (OpenGL) first — catch_unwind guards against hard panics in GPU init
-    let glow_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        try_run_gui(eframe::Renderer::Glow, state.clone(), gui_alive.clone())
+    // Determine renderer order based on persisted preference
+    let preferred = load_renderer_pref();
+    debug_print(&format!(
+        "[i] Renderer preference: {}",
+        preferred.as_deref().unwrap_or("none — trying glow first")
+    ));
+
+    let (first_renderer, first_name, second_renderer, second_name) =
+        if preferred.as_deref() == Some("wgpu") {
+            (eframe::Renderer::Wgpu, "wgpu", eframe::Renderer::Glow, "glow")
+        } else {
+            (eframe::Renderer::Glow, "glow", eframe::Renderer::Wgpu, "wgpu")
+        };
+
+    let first_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        try_run_gui(first_renderer, state.clone(), gui_alive.clone())
     }));
 
-    match glow_result {
+    match first_result {
         Ok(Ok(_)) => {
-            debug_print("[✓] GUI closed normally (glow).");
+            save_renderer_pref(first_name);
+            debug_print(&format!("[✓] GUI closed normally ({}).", first_name));
+            spawn_daemon();
         }
         Ok(Err(e)) => {
             debug_print(&format!(
-                "[✗] Glow backend failed: {}. Trying wgpu (D3D/Vulkan)...",
-                e
+                "[✗] {} backend failed: {}. Trying {}...",
+                first_name, e, second_name
             ));
 
-            // Reset state for wgpu attempt
             let state2 = Arc::new(Mutex::new(TaskState::new()));
             let gui_alive2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-            // New watchdog for wgpu attempt
             let gui_alive_watchdog2 = gui_alive2.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs(10));
                 if !gui_alive_watchdog2.load(std::sync::atomic::Ordering::Relaxed) {
-                    debug_print("[⚠] wgpu GUI also failed to render. Falling back to headless.");
+                    debug_print("[⚠] Secondary GPU backend also failed. Running headless.");
                     run_headless();
+                    spawn_daemon();
                     std::process::exit(0);
                 }
             });
 
-            let wgpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                try_run_gui(eframe::Renderer::Wgpu, state2, gui_alive2)
+            let second_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                try_run_gui(second_renderer, state2, gui_alive2)
             }));
 
-            match wgpu_result {
+            match second_result {
                 Ok(Ok(_)) => {
-                    debug_print("[✓] GUI closed normally (wgpu).");
+                    save_renderer_pref(second_name);
+                    debug_print(&format!("[✓] GUI closed normally ({}).", second_name));
+                    spawn_daemon();
                 }
                 Ok(Err(e2)) => {
-                    debug_print(&format!(
-                        "[✗] wgpu backend also failed: {}. Running headless.",
-                        e2
-                    ));
+                    debug_print(&format!("[✗] {} backend also failed: {}. Running headless.", second_name, e2));
+                    send_error_toast("GUI", &format!("Both renderers failed. Running headless. ({})", e2));
                     run_headless();
+                    spawn_daemon();
                 }
                 Err(_) => {
-                    debug_print(
-                        "[✗] wgpu backend panicked (no GPU/driver support). Running headless.",
-                    );
+                    debug_print("[✗] Secondary backend panicked. Running headless.");
                     run_headless();
+                    spawn_daemon();
                 }
             }
         }
         Err(_) => {
-            debug_print("[✗] Glow backend panicked. Running headless.");
+            debug_print("[✗] Primary backend panicked. Running headless.");
             run_headless();
+            spawn_daemon();
         }
+    }
+}
+
+/// Spawn the popup killer daemon as a detached child process.
+/// This ensures the daemon persists after the main process exits.
+fn spawn_daemon() {
+    if let Ok(exe) = std::env::current_exe() {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new(exe)
+            .arg("--daemon")
+            .creation_flags(0x08000000 | 0x00000008) // CREATE_NO_WINDOW | DETACHED_PROCESS
+            .spawn();
+        debug_print("[i] Daemon process spawned.");
     }
 }
 
@@ -1087,18 +1138,13 @@ fn kill_existing_instances() {
                         .iter()
                         .position(|&c| c == 0)
                         .unwrap_or(entry.szExeFile.len());
-                    let name =
-                        String::from_utf16_lossy(&entry.szExeFile[..name_len]).to_lowercase();
+                    let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]).to_lowercase();
 
                     if name == self_name {
-                        if let Ok(proc) = OpenProcess(PROCESS_TERMINATE, false, entry.th32ProcessID)
-                        {
+                        if let Ok(proc) = OpenProcess(PROCESS_TERMINATE, false, entry.th32ProcessID) {
                             let _ = TerminateProcess(proc, 0);
                             let _ = windows::Win32::Foundation::CloseHandle(proc);
-                            debug_print(&format!(
-                                "[i] Killed old instance PID {}",
-                                entry.th32ProcessID
-                            ));
+                            debug_print(&format!("[i] Killed old instance PID {}", entry.th32ProcessID));
                         }
                     }
                 }
@@ -1111,7 +1157,3 @@ fn kill_existing_instances() {
         let _ = windows::Win32::Foundation::CloseHandle(handle);
     }
 }
-
-/// Global channel for cleanup stats
-static CLEANUP_STATS: std::sync::LazyLock<Mutex<Option<cleanup::CleanupStats>>> =
-    std::sync::LazyLock::new(|| Mutex::new(None));

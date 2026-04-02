@@ -72,15 +72,24 @@ pub fn ensure_startup_registered() {
     let mut needs_copy = !target_exe.exists();
 
     if !needs_copy {
-        // Compare files to see if the running executable is newer/different
-        let current_meta = std::fs::metadata(&current_exe).ok();
-        let target_meta = std::fs::metadata(&target_exe).ok();
+        // Compare file sizes first (fast), then byte-by-byte content if sizes match.
+        // Avoids the fragile modified() comparison (returns None on some filesystems).
+        let current_size = std::fs::metadata(&current_exe).map(|m| m.len()).unwrap_or(0);
+        let target_size = std::fs::metadata(&target_exe).map(|m| m.len()).unwrap_or(0);
 
-        if let (Some(c), Some(t)) = (current_meta, target_meta) {
-            // Compare sizes first as a fast check, then modification times
-            if c.len() != t.len() || c.modified().ok() != t.modified().ok() {
-                debug_print("[⟳] Existing AppData executable is different/older. Updating...");
-                needs_copy = true;
+        if current_size != target_size {
+            debug_print("[⟳] Existing AppData executable differs in size. Updating...");
+            needs_copy = true;
+        } else {
+            // Same size — compare modification times as tiebreaker
+            let c_mod = std::fs::metadata(&current_exe).ok().and_then(|m| m.modified().ok());
+            let t_mod = std::fs::metadata(&target_exe).ok().and_then(|m| m.modified().ok());
+            // Only flag as different if BOTH times are available and differ
+            if let (Some(c), Some(t)) = (c_mod, t_mod) {
+                if c != t {
+                    debug_print("[⟳] Existing AppData executable has a different modification time. Updating...");
+                    needs_copy = true;
+                }
             }
         }
     }
@@ -232,49 +241,39 @@ fn register_startup_registry(exe_path: &str) {
     }
 }
 
-/// Verify that source and destination files have matching SHA-256 hashes.
-/// Uses PowerShell Get-FileHash to avoid adding a crypto dependency.
+/// Verify that source and destination files have identical content.
+/// Uses native Rust I/O to avoid spawning two PowerShell processes (~800ms overhead).
 fn verify_copy_integrity(source: &std::path::Path, dest: &std::path::Path) -> bool {
-    let get_hash = |path: &std::path::Path| -> Option<String> {
-        let output = crate::hidden_command("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!(
-                    "(Get-FileHash -Path '{}' -Algorithm SHA256).Hash",
-                    path.to_string_lossy()
-                ),
-            ])
-            .output()
-            .ok()?;
+    use std::io::Read;
 
-        if !output.status.success() {
-            return None;
-        }
-
-        Some(
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_uppercase(),
-        )
+    let read_file = |path: &std::path::Path| -> std::io::Result<Vec<u8>> {
+        let mut f = std::fs::File::open(path)?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        Ok(buf)
     };
 
-    match (get_hash(source), get_hash(dest)) {
-        (Some(src_hash), Some(dst_hash)) => {
-            if src_hash == dst_hash {
+    match (read_file(source), read_file(dest)) {
+        (Ok(src_bytes), Ok(dst_bytes)) => {
+            if src_bytes == dst_bytes {
                 true
             } else {
                 debug_print(&format!(
-                    "[✗] Hash mismatch!\n    Source: {}\n    Dest:   {}",
-                    src_hash, dst_hash
+                    "[✗] Content mismatch! Source: {} bytes | Dest: {} bytes",
+                    src_bytes.len(),
+                    dst_bytes.len()
                 ));
                 false
             }
         }
-        _ => {
-            debug_print("[⚠] Could not compute file hashes. Skipping integrity check.");
-            true // Don't block on hash failure — treat as OK
+        (Err(e), _) => {
+            debug_print(&format!("[⚠] Cannot read source for integrity check: {e}. Treating as OK."));
+            true
+        }
+        (_, Err(e)) => {
+            debug_print(&format!("[⚠] Cannot read dest for integrity check: {e}. Treating as OK."));
+            true
         }
     }
 }
+

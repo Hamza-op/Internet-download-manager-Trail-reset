@@ -32,7 +32,9 @@ struct KillerContext {
 pub fn run_background_loop() {
     println!("[i] Started background IDM popup killer loop...");
 
-    // Drop working set size immediately to minimize RAM footprint (~1MB instead of ~15MB)
+    // Drop working set size immediately to minimize RAM footprint (~1MB instead of ~15MB).
+    // Passing (SIZE_T)-1 for both min/max is the documented Windows idiom to trim the
+    // working set to its minimum — usize::MAX wraps to (SIZE_T)-1 on both 32 and 64-bit.
     unsafe {
         let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
