@@ -927,8 +927,6 @@ fn main() {
         }
         startup::ensure_startup_registered();
         run_headless();
-        // Spawn daemon as child process after headless completes
-        spawn_daemon();
         return;
     }
 
@@ -955,7 +953,6 @@ fn main() {
                 st.is_done = true;
             }
             run_headless();
-            spawn_daemon();
             std::process::exit(0);
         }
     });
@@ -1034,7 +1031,6 @@ fn main() {
         Ok(Ok(_)) => {
             save_renderer_pref(first_name);
             debug_print(&format!("[✓] GUI closed normally ({}).", first_name));
-            spawn_daemon();
         }
         Ok(Err(e)) => {
             debug_print(&format!(
@@ -1051,7 +1047,6 @@ fn main() {
                 if !gui_alive_watchdog2.load(std::sync::atomic::Ordering::Relaxed) {
                     debug_print("[⚠] Secondary GPU backend also failed. Running headless.");
                     run_headless();
-                    spawn_daemon();
                     std::process::exit(0);
                 }
             });
@@ -1064,41 +1059,26 @@ fn main() {
                 Ok(Ok(_)) => {
                     save_renderer_pref(second_name);
                     debug_print(&format!("[✓] GUI closed normally ({}).", second_name));
-                    spawn_daemon();
                 }
                 Ok(Err(e2)) => {
                     debug_print(&format!("[✗] {} backend also failed: {}. Running headless.", second_name, e2));
                     send_error_toast("GUI", &format!("Both renderers failed. Running headless. ({})", e2));
                     run_headless();
-                    spawn_daemon();
                 }
                 Err(_) => {
                     debug_print("[✗] Secondary backend panicked. Running headless.");
                     run_headless();
-                    spawn_daemon();
                 }
             }
         }
         Err(_) => {
             debug_print("[✗] Primary backend panicked. Running headless.");
             run_headless();
-            spawn_daemon();
         }
     }
 }
 
-/// Spawn the popup killer daemon as a detached child process.
-/// This ensures the daemon persists after the main process exits.
-fn spawn_daemon() {
-    if let Ok(exe) = std::env::current_exe() {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new(exe)
-            .arg("--daemon")
-            .creation_flags(0x08000000 | 0x00000008) // CREATE_NO_WINDOW | DETACHED_PROCESS
-            .spawn();
-        debug_print("[i] Daemon process spawned.");
-    }
-}
+
 
 /// Kill all other running instances of our own executable.
 fn kill_existing_instances() {
