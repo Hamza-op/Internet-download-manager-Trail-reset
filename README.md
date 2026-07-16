@@ -12,7 +12,7 @@ A lightweight, high-performance system optimization tool written in Rust using `
 *   **⚡ Startup & Services:** Disables 15+ non-essential Windows services, removes bloatware startup entries, disables scheduled defrag, removes startup delay, and disables background apps globally.
 *   **🔁 Smart Idempotency:** One-time tasks are tracked per-task via registry and skipped on repeat runs. Always-run tasks (temp cleanup, Adobe, IDM) execute every boot.
 
-## 🛠️ Built With
+## 🛠️ Built
 
 *   [Rust](https://www.rust-lang.org/) - Core logic and safe systems programming.
 *   [egui](https://github.com/emilk/egui) - The immediate mode GUI library for Rust.
